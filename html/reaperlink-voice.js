@@ -251,6 +251,11 @@
           `${base}/voice/events/${token}/${eventAfter}`,
           { cache:'no-store', credentials:'omit' }
         );
+        if (r.status === 409) {
+          await stopVoice(false);
+          setStatus('Using FiveM headset audio', 'warn');
+          return;
+        }
         if (!r.ok) throw new Error('voice events ' + r.status);
         const body = await r.json();
         const events = Array.isArray(body.events) ? body.events : [];
@@ -366,8 +371,15 @@
   window.addEventListener('message', event => {
     const message = event && event.data;
     if (!message || typeof message !== 'object') return;
-    if (message.action !== 'call') return;
 
+    if (message.action === 'reaperlink:voiceFallback') {
+      stopVoice(false).then(() => {
+        setStatus('Using FiveM headset audio', 'warn');
+      }).catch(() => {});
+      return;
+    }
+
+    if (message.action !== 'call') return;
     const call = message.call;
     if (call && call.state === 'active' && call.id) {
       startVoice(call.id).catch(() => {});
