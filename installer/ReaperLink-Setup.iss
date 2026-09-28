@@ -36,7 +36,7 @@ VersionInfoVersion=0.1.0.0
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription=ReaperLink Voice FiveM Tester Installer
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductVersion=0.1.0.0
 
 [Files]
 Source: "ReaperLink-InstallCore.ps1"; DestDir: "{tmp}\ReaperLinkSetup"; Flags: ignoreversion deleteafterinstall
