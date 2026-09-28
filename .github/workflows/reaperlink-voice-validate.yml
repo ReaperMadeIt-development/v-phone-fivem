@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: reaperlink-voice-validate-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     name: ${{ matrix.slot }} - ${{ matrix.task }}
