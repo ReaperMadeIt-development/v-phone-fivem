@@ -1257,6 +1257,17 @@ else
         TriggerServerEvent('v-phone:physical:pairRequest')
     end, false)
 
+
+    RegisterCommand('reaperlinkvoicetest', function()
+        if not physicalActive then
+            print('[ReaperLink Voice] Pair the physical phone first with /physicalpair.')
+            return
+        end
+        -- Solo hardware check: the paired phone records a short sample and plays it back
+        -- locally. This does not fake a call or bypass server call membership.
+        SendNUIMessage({ action = 'reaperlink:voiceSelfTest' })
+    end, false)
+
     RegisterNetEvent('v-phone:physical:pairCode', function(code, seconds, pairUrl, configured)
         local msg = ('ReaperLink pairing code: %s (valid for %s seconds)'):format(
             tostring(code), tostring(seconds or 600))
