@@ -3067,7 +3067,12 @@ end)
 -- Calls
 -- ══════════════════════════════════════════════════════════════
 -- The audio is v-voice's; these four handlers only start and stop it at the right moments.
+function ReaperLinkCallIsActive(id)
+    return call and call.state == 'active' and tonumber(call.id) == tonumber(id)
+end
+
 local function joinCallAudio()
+    if ReaperLinkMixedVoiceActive and ReaperLinkMixedVoiceActive(call and call.id) then return end
     if voice() then exports['v-voice']:PhoneCallStart(call and call.id) end
 end
 
