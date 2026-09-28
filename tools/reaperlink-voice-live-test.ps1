@@ -142,6 +142,23 @@ if ($cloudflared) {
 Say "Current voice ICE settings:" Cyan
 Select-String -LiteralPath $ServerCfg -Pattern "reaperlink_voice_(stun|turn)" -ErrorAction SilentlyContinue
 
+# The test server depends on XAMPP MySQL. Start it only when port 3306 is not listening.
+$dbUp = Get-NetTCPConnection -LocalPort 3306 -State Listen -ErrorAction SilentlyContinue
+if (-not $dbUp) {
+    $mysqlStart = "D:\xampp\mysql_start.bat"
+    if (Test-Path -LiteralPath $mysqlStart) {
+        Say "MySQL is down; starting XAMPP MySQL..." Yellow
+        Start-Process -FilePath $mysqlStart
+        Start-Sleep -Seconds 5
+        $dbUp = Get-NetTCPConnection -LocalPort 3306 -State Listen -ErrorAction SilentlyContinue
+    }
+}
+if ($dbUp) {
+    Say "PASS  MySQL listening on 3306" Green
+} else {
+    Say "WARNING  MySQL is not listening on 3306. FiveM character login may fail." Red
+}
+
 Say "Starting FXServer..." Yellow
 Start-Process -FilePath $FxServer
 Start-Sleep -Seconds 5
