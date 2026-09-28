@@ -94,11 +94,29 @@ jobs:
         id: inno
         shell: powershell
         run: |
-          $candidates = @(
-            "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-          )
-          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          function Find-Iscc {
+            $candidates = @(
+              "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+              "$env:LOCALAPPDATA\Inno Setup 6\ISCC.exe"
+            )
+
+            foreach ($regPath in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1'
+            )) {
+              try {
+                $loc = (Get-ItemProperty -LiteralPath $regPath -ErrorAction Stop).InstallLocation
+                if ($loc) { $candidates += (Join-Path $loc 'ISCC.exe') }
+              } catch {}
+            }
+
+            return ($candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1)
+          }
+
+          $iscc = Find-Iscc
 
           if (-not $iscc) {
             $winget = Get-Command winget -ErrorAction SilentlyContinue
@@ -107,15 +125,9 @@ jobs:
               if ($LASTEXITCODE -ne 0) {
                 Write-Warning "winget returned $LASTEXITCODE while installing Inno Setup."
               }
+              Start-Sleep -Seconds 2
+              $iscc = Find-Iscc
             }
-          }
-
-          if (-not $iscc) {
-            $candidates = @(
-              "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
-              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-            )
-            $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           }
 
           if (-not $iscc) {
@@ -125,19 +137,27 @@ jobs:
               if ($LASTEXITCODE -ne 0) {
                 Write-Warning "Chocolatey returned $LASTEXITCODE while installing Inno Setup."
               }
+              Start-Sleep -Seconds 2
+              $iscc = Find-Iscc
             }
           }
 
           if (-not $iscc) {
-            $candidates = @(
-              "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
-              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-            )
-            $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            $roots = @($env:ProgramFiles, $env:LOCALAPPDATA)
+            $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+            if ($pf86) { $roots += $pf86 }
+            foreach ($root in $roots) {
+              if ($root -and (Test-Path -LiteralPath $root)) {
+                $hit = Get-ChildItem -LiteralPath $root -Filter ISCC.exe -File -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match 'Inno Setup' } |
+                  Select-Object -First 1
+                if ($hit) { $iscc = $hit.FullName; break }
+              }
+            }
           }
 
           if (-not $iscc) {
-            throw "Inno Setup 6 compiler (ISCC.exe) is not available on this runner."
+            throw "Inno Setup 6 compiler (ISCC.exe) is not available on this runner after installation."
           }
 
           "iscc=$iscc" >> $env:GITHUB_OUTPUT
