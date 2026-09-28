@@ -35,6 +35,12 @@ if IsDuplicityVersion() then
     local chunks = {}          -- token:request -> { total, parts, expires }
     local rate = {}            -- token -> { started, count }
 
+    -- ReaperLink Voice signaling. Media stays browser-to-browser; the FXServer HTTP
+    -- handler only authenticates paired sessions and relays SDP/ICE signaling.
+    local voiceById = {}       -- opaque voice id -> session token
+    local voiceRooms = {}      -- call id string -> { [voiceId] = true }
+    local voiceSignals = {}    -- session token -> { seq = n, events = {...} }
+
     math.randomseed(os.time() + GetGameTimer())
 
     local function htmlEscape(value)
@@ -120,6 +126,56 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
         return table.concat(out)
     end
 
+
+    local function randomVoiceId()
+        local out = {}
+        for i = 1, 3 do out[i] = ('%08x'):format(math.random(0, 0x7fffffff)) end
+        return table.concat(out)
+    end
+
+    local function voiceQueue(token)
+        local q = voiceSignals[token]
+        if not q then
+            q = { seq = 0, events = {} }
+            voiceSignals[token] = q
+        end
+        return q
+    end
+
+    local function voicePush(token, event)
+        if type(event) ~= 'table' then return end
+        local q = voiceQueue(token)
+        q.seq = q.seq + 1
+        q.events[#q.events + 1] = { seq = q.seq, event = event }
+        if #q.events > 256 then table.remove(q.events, 1) end
+    end
+
+    local function voiceLeave(token, announce)
+        local s = sessions[token]
+        if not s then return end
+        local voiceId = s.voiceId
+        local callId = s.voiceCallId
+        if voiceId then voiceById[voiceId] = nil end
+        if callId then
+            local room = voiceRooms[tostring(callId)]
+            if room and voiceId then
+                room[voiceId] = nil
+                if announce then
+                    for peerId in pairs(room) do
+                        local peerToken = voiceById[peerId]
+                        if peerToken then
+                            voicePush(peerToken, { type = 'peer-leave', peer = voiceId })
+                        end
+                    end
+                end
+                if next(room) == nil then voiceRooms[tostring(callId)] = nil end
+            end
+        end
+        s.voiceJoined = false
+        s.voiceId = nil
+        voiceSignals[token] = nil
+    end
+
     local function reaperLinkPublicBase()
         local base = tostring(GetConvar('reaperlink_public_url', '') or '')
         base = base:gsub('^%s+', '')
@@ -154,6 +210,7 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
     local function endSession(token, tellClient)
         local s = sessions[token]
         if not s then return end
+        voiceLeave(token, true)
         sessions[token] = nil
         rate[token] = nil
 
@@ -233,6 +290,17 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
         if not token then return end
         local s = sessionForToken(token, false)
         if not s or type(message) ~= 'table' then return end
+
+        -- The paired FiveM client is authoritative for which call this browser may join.
+        -- A browser never supplies an arbitrary call id.
+        if message.action == 'call' then
+            local nextCall = type(message.call) == 'table' and message.call or nil
+            local nextId = nextCall and nextCall.state == 'active' and tonumber(nextCall.id) or nil
+            if s.voiceCallId ~= nextId then
+                if s.voiceJoined then voiceLeave(token, true) end
+                s.voiceCallId = nextId
+            end
+        end
 
         s.seq = s.seq + 1
         s.events[#s.events + 1] = { seq = s.seq, message = message }
@@ -410,6 +478,143 @@ document.getElementById('pair').addEventListener('submit',function(e){
             return
         end
 
+        local voiceJoinToken = path:match('^/physical/voice/join/([%w_-]+)$')
+        if voiceJoinToken then
+            local s = sessionForToken(voiceJoinToken)
+            if not s or not s.voiceCallId then
+                sendJson(res, 409, { error = 'no-active-call' })
+                return
+            end
+
+            if not s.voiceId then
+                local id
+                repeat id = randomVoiceId() until not voiceById[id]
+                s.voiceId = id
+                voiceById[id] = voiceJoinToken
+            end
+
+            local callKey = tostring(s.voiceCallId)
+            local room = voiceRooms[callKey]
+            if not room then room = {}; voiceRooms[callKey] = room end
+
+            local peers = {}
+            for peerId in pairs(room) do
+                if peerId ~= s.voiceId then peers[#peers + 1] = peerId end
+            end
+
+            if not room[s.voiceId] then
+                room[s.voiceId] = true
+                s.voiceJoined = true
+                for peerId in pairs(room) do
+                    if peerId ~= s.voiceId then
+                        local peerToken = voiceById[peerId]
+                        if peerToken then
+                            voicePush(peerToken, { type = 'peer-join', peer = s.voiceId })
+                        end
+                    end
+                end
+            end
+
+            local q = voiceQueue(voiceJoinToken)
+            sendJson(res, 200, {
+                ok = true,
+                voiceId = s.voiceId,
+                callId = s.voiceCallId,
+                peers = peers,
+                seq = q.seq,
+            })
+            return
+        end
+
+        local voiceLeaveToken = path:match('^/physical/voice/leave/([%w_-]+)$')
+        if voiceLeaveToken then
+            local s = sessionForToken(voiceLeaveToken, false)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            voiceLeave(voiceLeaveToken, true)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voicePollToken, voiceAfter =
+            path:match('^/physical/voice/events/([%w_-]+)/(%d+)$')
+        if voicePollToken then
+            local s = sessionForToken(voicePollToken)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            local q = voiceQueue(voicePollToken)
+            local after = tonumber(voiceAfter) or 0
+            local events = {}
+            for _, entry in ipairs(q.events) do
+                if entry.seq > after then events[#events + 1] = entry end
+            end
+            sendJson(res, 200, { ok = true, seq = q.seq, events = events })
+            return
+        end
+
+        local voiceChunkToken, voiceRequestId, voiceChunkIndex, voiceChunkTotal, voicePiece =
+            path:match('^/physical/voice/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if voiceChunkToken then
+            local s = sessionForToken(voiceChunkToken)
+            if not s or not s.voiceJoined then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+            local idx, total = tonumber(voiceChunkIndex), tonumber(voiceChunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #voicePiece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+            local key = 'voice:' .. voiceChunkToken .. ':' .. voiceRequestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = voicePiece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voiceSendToken, voiceSendRequest, voicePeer =
+            path:match('^/physical/voice/send/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if voiceSendToken then
+            local s = sessionForToken(voiceSendToken)
+            if not s or not s.voiceJoined or not s.voiceCallId or not s.voiceId then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+
+            local key = 'voice:' .. voiceSendToken .. ':' .. voiceSendRequest
+            local set = chunks[key]
+            if not set then sendJson(res, 400, { error = 'missing-chunks' }); return end
+            local parts = {}
+            for i = 1, set.total do
+                if not set.parts[i] then sendJson(res, 400, { error = 'missing-chunk' }); return end
+                parts[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local decoded = b64urlDecode(table.concat(parts))
+            local ok, payload = pcall(json.decode, decoded)
+            if not ok or type(payload) ~= 'table' then
+                sendJson(res, 400, { error = 'signal' })
+                return
+            end
+
+            local peerToken = voiceById[voicePeer]
+            local peerSession = peerToken and sessionForToken(peerToken, false) or nil
+            if not peerSession or not peerSession.voiceJoined
+                or tostring(peerSession.voiceCallId or '') ~= tostring(s.voiceCallId) then
+                sendJson(res, 404, { error = 'peer' })
+                return
+            end
+
+            voicePush(peerToken, { type = 'signal', peer = s.voiceId, data = payload })
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
         local uiToken = path:match('^/physical/ui/([%w_-]+)/*$')
         if uiToken then
             local s = sessionForToken(uiToken)
@@ -432,6 +637,7 @@ document.getElementById('pair').addEventListener('submit',function(e){
             local boot = ([[<script>
 window.__VPHONE_PHYSICAL__={token:"%s",base:"%s",resource:"%s"};
 </script><script src="physical.js"></script>
+<script src="reaperlink-voice.js"></script>
 <script src="sdk.js"></script>]]):format(uiToken, root, RES)
 
             index = index:gsub('<script src="sdk%.js"></script>', boot, 1)
