@@ -12,7 +12,7 @@ permissions:
 jobs:
   squad:
     name: ${{ matrix.slot }} - ${{ matrix.task }}
-    runs-on: [self-hosted, org-shared]
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 25
     strategy:
       fail-fast: false
