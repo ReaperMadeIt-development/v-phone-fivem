@@ -64,3 +64,50 @@ jobs:
           name: reaperlink-voice-validate-${{ matrix.task }}-${{ runner.name }}
           path: .voice-validation\${{ matrix.task }}.txt
           if-no-files-found: error
+
+
+  package:
+    name: Build distributable tester ZIP
+    needs: validate
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate installer syntax
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ".\installer\ReaperLink-Test-Installer.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw "Installer PowerShell syntax validation failed."
+          }
+          Write-Host "Installer syntax OK"
+
+      - name: Build self-contained tester package
+        shell: powershell
+        run: |
+          .\tools\build-reaperlink-tester-package.ps1
+
+      - name: Verify package
+        shell: powershell
+        run: |
+          $zip = ".\dist\ReaperLink-Tester-Package.zip"
+          if (-not (Test-Path -LiteralPath $zip)) { throw "Package ZIP missing." }
+          $size = (Get-Item -LiteralPath $zip).Length
+          if ($size -lt 100000) { throw "Package ZIP is unexpectedly small: $size bytes" }
+          Write-Host "Package OK: $size bytes"
+
+      - name: Upload tester package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReaperLink-Tester-Package
+          path: dist/ReaperLink-Tester-Package.zip
+          if-no-files-found: error
+          retention-days: 14
