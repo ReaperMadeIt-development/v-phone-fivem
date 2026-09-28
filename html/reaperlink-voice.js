@@ -368,9 +368,113 @@
     if (hide) setStatus('', 'warn', false);
   }
 
+
+  async function selfTest() {
+    if (!window.isSecureContext) {
+      setStatus('Solo test needs HTTPS', 'bad');
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('Phone browser has no microphone access', 'bad');
+      return;
+    }
+    if (typeof MediaRecorder !== 'function') {
+      setStatus('This browser cannot record a mic sample', 'bad');
+      return;
+    }
+
+    let stream = null;
+    let recorder = null;
+    try {
+      setStatus('Solo test · requesting microphone…', 'warn');
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation:true,
+          noiseSuppression:true,
+          autoGainControl:true
+        },
+        video:false
+      });
+
+      const chunks = [];
+      recorder = new MediaRecorder(stream);
+      recorder.ondataavailable = event => {
+        if (event.data && event.data.size) chunks.push(event.data);
+      };
+
+      const stopped = new Promise((resolve, reject) => {
+        recorder.onerror = event => reject(event.error || new Error('recording failed'));
+        recorder.onstop = resolve;
+      });
+
+      recorder.start();
+      setStatus('Solo test · SPEAK NOW (3 seconds)', 'live');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      if (recorder.state !== 'inactive') recorder.stop();
+      await stopped;
+
+      for (const track of stream.getTracks()) {
+        try { track.stop(); } catch (_) {}
+      }
+      stream = null;
+
+      if (!chunks.length) throw new Error('no recorded audio');
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      const url = URL.createObjectURL(blob);
+      const audio = document.createElement('audio');
+      audio.playsInline = true;
+      audio.src = url;
+      audio.style.display = 'none';
+      document.body.appendChild(audio);
+
+      const cleanup = () => {
+        try { URL.revokeObjectURL(url); audio.remove(); } catch (_) {}
+        setTimeout(() => setStatus('', 'warn', false), 1800);
+      };
+      audio.onended = cleanup;
+      audio.onerror = () => {
+        setStatus('Solo test playback failed', 'bad');
+        cleanup();
+      };
+
+      setStatus('Solo test · playing your recording…', 'live');
+      try {
+        await audio.play();
+      } catch (_) {
+        setStatus('Tap the phone screen to play your recording', 'warn');
+        const playOnTap = async () => {
+          try {
+            await audio.play();
+            setStatus('Solo test · playing your recording…', 'live');
+          } catch (_) {
+            setStatus('Solo test playback blocked', 'bad');
+            cleanup();
+          }
+        };
+        document.addEventListener('pointerdown', playOnTap, { once:true });
+      }
+    } catch (err) {
+      console.error('[ReaperLink Voice] solo self-test failed', err);
+      setStatus('Solo test failed · check microphone permission', 'bad');
+      if (recorder && recorder.state !== 'inactive') {
+        try { recorder.stop(); } catch (_) {}
+      }
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          try { track.stop(); } catch (_) {}
+        }
+      }
+    }
+  }
+
   window.addEventListener('message', event => {
     const message = event && event.data;
     if (!message || typeof message !== 'object') return;
+
+    if (message.action === 'reaperlink:voiceSelfTest') {
+      selfTest().catch(() => {});
+      return;
+    }
 
     if (message.action === 'reaperlink:voiceFallback') {
       stopVoice(false).then(() => {
@@ -397,6 +501,7 @@
     stop: stopVoice,
     setMuted,
     toggleMute: () => setMuted(!muted),
+    selfTest,
     state: () => ({
       callId:activeCallId,
       voiceId,
