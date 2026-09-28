@@ -158,6 +158,7 @@
     if (pc) return pc;
 
     pc = new RTCPeerConnection({ iceServers: iceServers() });
+    pc.__reaperPendingIce = [];
     peers.set(peerId, pc);
 
     if (localStream) {
@@ -206,6 +207,13 @@
     await sendSignal(peerId, { type:'description', description:pc.localDescription });
   }
 
+  async function flushIce(pc) {
+    const pending = Array.isArray(pc.__reaperPendingIce) ? pc.__reaperPendingIce.splice(0) : [];
+    for (const candidate of pending) {
+      try { await pc.addIceCandidate(candidate); } catch (_) {}
+    }
+  }
+
   async function handleSignal(peerId, data) {
     if (!data || typeof data !== 'object') return;
     const pc = peerConnection(peerId);
@@ -214,17 +222,23 @@
       const desc = data.description;
       if (desc.type === 'offer') {
         await pc.setRemoteDescription(desc);
+        await flushIce(pc);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         await sendSignal(peerId, { type:'description', description:pc.localDescription });
       } else if (desc.type === 'answer') {
         await pc.setRemoteDescription(desc);
+        await flushIce(pc);
       }
       return;
     }
 
     if (data.type === 'ice' && data.candidate) {
-      try { await pc.addIceCandidate(data.candidate); } catch (_) {}
+      if (!pc.remoteDescription || !pc.remoteDescription.type) {
+        pc.__reaperPendingIce.push(data.candidate);
+      } else {
+        try { await pc.addIceCandidate(data.candidate); } catch (_) {}
+      }
     }
   }
 
