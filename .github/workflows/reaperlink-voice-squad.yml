@@ -1,9 +1,6 @@
 name: ReaperLink Voice Squad
 
 on:
-  push:
-    branches:
-      - reaperlink-voice-dev
   workflow_dispatch:
 
 permissions:
