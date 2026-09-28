@@ -2201,6 +2201,9 @@ local function pushRoster(id)
             canAdd = canAddFrom(c, s),
         })
     end
+    if type(ReaperLinkVoiceRefreshCall) == 'function' then
+        ReaperLinkVoiceRefreshCall(id)
+    end
 end
 
 --- Everyone hears how good everyone else's line is, straight away.
@@ -2241,6 +2244,9 @@ local function endCall(id, reason)
         TriggerClientEvent('v-phone:client:voicemailOffer', c.a, { number = c.bNum })
     end
     Calls[id] = nil
+    if type(ReaperLinkVoiceEndCall) == 'function' then
+        ReaperLinkVoiceEndCall(id)
+    end
     -- Everybody still attached, not just the two it was placed between. Somebody who already
     -- left has had their end sent and their `CallOf` cleared, so the check below skips them.
     for _, s in ipairs(callMembers(c)) do
