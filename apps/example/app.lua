@@ -663,6 +663,18 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
             for key, set in pairs(chunks) do
                 if not set or set.expires <= tick then chunks[key] = nil end
             end
+
+            -- A mobile browser can vanish without pagehide (OS kill, Wi-Fi loss, tab crash).
+            -- Its voice endpoint polls several times a second, so fifteen seconds of silence
+            -- means it is gone and the remaining FiveM users should fall back to normal voice.
+            local stale = {}
+            for id, ep in pairs(voiceById) do
+                if ep.kind == 'physical' and ep.lastSeen
+                    and tick - ep.lastSeen > VOICE_STALE_MS then
+                    stale[#stale + 1] = id
+                end
+            end
+            for _, id in ipairs(stale) do removeVoiceEndpoint(id, true, true) end
         end
     end)
 
@@ -736,6 +748,7 @@ document.getElementById('pair').addEventListener('submit',function(e){
                 voiceById[id] = {
                     kind = 'physical', token = voiceJoinToken,
                     source = s.source, callId = s.voiceCallId,
+                    lastSeen = GetGameTimer(),
                 }
             end
 
@@ -777,6 +790,8 @@ document.getElementById('pair').addEventListener('submit',function(e){
         if voicePollToken then
             local s = sessionForToken(voicePollToken)
             if not s then sendJson(res, 403, { error = 'session' }); return end
+            local ep = s.voiceId and voiceById[s.voiceId] or nil
+            if ep and ep.kind == 'physical' then ep.lastSeen = GetGameTimer() end
             local q = voiceQueue(voicePollToken)
             local afterSeq = tonumber(voiceAfter) or 0
             local events = {}
