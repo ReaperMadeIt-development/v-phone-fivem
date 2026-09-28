@@ -2137,6 +2137,18 @@ local function callPeers(c, src)
     return out
 end
 
+
+--- ReaperLink Voice asks one server-authoritative question: which active call is this source
+--- really on, and who else is active on it? No browser or client chooses a call id.
+function ReaperLinkCallBridgeState(src)
+    src = tonumber(src)
+    local id = src and CallOf[src] or nil
+    local c = id and Calls[id] or nil
+    if not c or c.state ~= 'active' then return nil end
+    if not (c.live and c.live[src] and c.live[src].state == 'active') then return nil end
+    return { id = id, members = callActives(c) }
+end
+
 --- The list as one member should see it.
 ---
 --- A withheld number stays withheld: the caller who hid his number from the person he rang is
