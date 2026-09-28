@@ -1,0 +1,62 @@
+name: ReaperLink Voice Validate
+
+on:
+  push:
+    branches:
+      - reaperlink-voice-dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.slot }} - ${{ matrix.task }}
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        include:
+          - slot: Terminator
+            task: js-syntax
+          - slot: Predator
+            task: manifest
+          - slot: Johnny-5
+            task: signaling-routes
+          - slot: Rambo
+            task: session-security
+          - slot: Snake-Eyes
+            task: browser-voice
+          - slot: Dave
+            task: ice-config
+          - slot: Jeff
+            task: physical-regression
+          - slot: Steve
+            task: call-sync
+          - slot: Mike
+            task: https-gate
+          - slot: Gary
+            task: package-smoke
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node for JS syntax checks
+        if: matrix.task == 'js-syntax'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate ReaperLink Voice
+        shell: powershell
+        run: |
+          .\.github\scripts\reaperlink-voice-validate.ps1 -Task "${{ matrix.task }}" -Slot "${{ matrix.slot }}"
+
+      - name: Upload validation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: reaperlink-voice-validate-${{ matrix.task }}-${{ runner.name }}
+          path: .voice-validation\${{ matrix.task }}.txt
+          if-no-files-found: error
