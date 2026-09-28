@@ -419,7 +419,7 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
         for src in pairs(mixedMembers[key] or {}) do
             if GetPlayerName(src) then
                 TriggerClientEvent('v-phone:physical:voiceMode', src, {
-                    enabled = false, callId = callId,
+                    enabled = false, callId = callId, ended = true,
                 })
             end
         end
@@ -1134,7 +1134,8 @@ else
             mixedVoiceCallId = nil
             mixedVoiceSelfPhysical = false
             nativeSendNUIMessage({ action = 'reaperlink:gameVoiceStop', callId = old })
-            if type(ReaperLinkCallIsActive) == 'function' and ReaperLinkCallIsActive(old) then
+            if data.ended ~= true and type(ReaperLinkCallIsActive) == 'function'
+                and ReaperLinkCallIsActive(old) then
                 pcall(function() exports['v-voice']:PhoneCallStart(old) end)
             end
         end
