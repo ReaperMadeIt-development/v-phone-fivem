@@ -1,6 +1,9 @@
 name: ReaperLink Voice Validate
 
 on:
+  push:
+    branches:
+      - reaperlink-voice-dev
   workflow_dispatch:
 
 permissions:
