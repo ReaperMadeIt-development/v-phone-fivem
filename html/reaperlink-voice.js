@@ -14,6 +14,20 @@
   const nativeFetch = window.fetch.bind(window);
   const encoder = new TextEncoder();
 
+
+  function iceServers() {
+    const voice = cfg.voice && typeof cfg.voice === 'object' ? cfg.voice : {};
+    const servers = [];
+    if (voice.stun) servers.push({ urls:String(voice.stun) });
+    if (voice.turn && voice.turn.url) {
+      const entry = { urls:String(voice.turn.url) };
+      if (voice.turn.username) entry.username = String(voice.turn.username);
+      if (voice.turn.credential) entry.credential = String(voice.turn.credential);
+      servers.push(entry);
+    }
+    return servers;
+  }
+
   let activeCallId = null;
   let localStream = null;
   let voiceId = null;
@@ -143,7 +157,7 @@
     let pc = peers.get(peerId);
     if (pc) return pc;
 
-    pc = new RTCPeerConnection({ iceServers: [] });
+    pc = new RTCPeerConnection({ iceServers: iceServers() });
     peers.set(peerId, pc);
 
     if (localStream) {
