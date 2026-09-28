@@ -23,6 +23,7 @@ if IsDuplicityVersion() then
     local SESSION_IDLE_TTL = 21600 -- six hours without a handset request
     local REQUEST_TTL_MS = 20000
     local CHUNK_TTL_MS = 30000
+    local VOICE_STALE_MS = 15000
     local MAX_EVENT_QUEUE = 256
     local MAX_CHUNKS = 4096
     local MAX_CHUNK_CHARS = 6000
@@ -336,29 +337,28 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
         local previous = mixedMembers[key] or {}
         local room = voiceRooms[key]
 
-        local physicalSource
+        -- A physical endpoint only counts while its paired source is still an ACTIVE member
+        -- of this exact call. This prunes a browser that missed the final call message.
+        local physicalSource, state
         if room then
+            local invalid = {}
             for id in pairs(room) do
                 local ep = voiceById[id]
-                if ep and ep.kind == 'physical' then physicalSource = ep.source break end
+                if ep and ep.kind == 'physical' then
+                    local s = bridgeState(ep.source)
+                    if s and tonumber(s.id) == callId then
+                        physicalSource, state = ep.source, s
+                        break
+                    else
+                        invalid[#invalid + 1] = id
+                    end
+                end
             end
+            for _, id in ipairs(invalid) do removeVoiceEndpoint(id, true, false) end
+            room = voiceRooms[key]
         end
 
         if not physicalSource then
-            for src in pairs(previous) do
-                if GetPlayerName(src) then
-                    TriggerClientEvent('v-phone:physical:voiceMode', src, {
-                        enabled = false, callId = callId,
-                    })
-                end
-            end
-            mixedMembers[key] = nil
-            clearGameEndpoints(callId)
-            return
-        end
-
-        local state = bridgeState(physicalSource)
-        if not state or tonumber(state.id) ~= callId then
             for src in pairs(previous) do
                 if GetPlayerName(src) then
                     TriggerClientEvent('v-phone:physical:voiceMode', src, {
@@ -385,6 +385,19 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
                 })
             end
         end
+
+        -- A normal FiveM endpoint that left the conference must leave the WebRTC mesh too.
+        if room then
+            local gone = {}
+            for id in pairs(room) do
+                local ep = voiceById[id]
+                if ep and ep.kind == 'game' and not current[ep.source] then
+                    gone[#gone + 1] = id
+                end
+            end
+            for _, id in ipairs(gone) do removeVoiceEndpoint(id, true, false) end
+        end
+
         for src in pairs(previous) do
             if not current[src] and GetPlayerName(src) then
                 TriggerClientEvent('v-phone:physical:voiceMode', src, {
@@ -393,6 +406,32 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
             end
         end
         mixedMembers[key] = current
+    end
+
+    function ReaperLinkVoiceRefreshCall(callId)
+        updateMixedMode(callId)
+    end
+
+    function ReaperLinkVoiceEndCall(callId)
+        callId = tonumber(callId)
+        if not callId then return end
+        local key = tostring(callId)
+        for src in pairs(mixedMembers[key] or {}) do
+            if GetPlayerName(src) then
+                TriggerClientEvent('v-phone:physical:voiceMode', src, {
+                    enabled = false, callId = callId,
+                })
+            end
+        end
+        mixedMembers[key] = nil
+
+        local room = voiceRooms[key]
+        if room then
+            local ids = {}
+            for id in pairs(room) do ids[#ids + 1] = id end
+            for _, id in ipairs(ids) do removeVoiceEndpoint(id, false, false) end
+        end
+        voiceRooms[key] = nil
     end
 
     local function createSession(src, identity)
