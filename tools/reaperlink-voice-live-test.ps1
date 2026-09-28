@@ -14,7 +14,8 @@ $ZipUrl = "https://github.com/ReaperMadeIt-development/v-phone-fivem/archive/ref
 $Work = Join-Path $env:TEMP "ReaperLinkVoiceTest"
 $Zip = Join-Path $Work "v-phone.zip"
 $Extract = Join-Path $Work "extract"
-$TunnelLog = Join-Path $Work "cloudflared.log"
+$TunnelOut = Join-Path $Work "cloudflared.out.log"
+$TunnelErr = Join-Path $Work "cloudflared.err.log"
 
 function Say($Text, $Color = "Gray") {
     Write-Host $Text -ForegroundColor $Color
@@ -101,21 +102,27 @@ if ($cloudflared) {
     Say "Starting HTTPS quick tunnel..." Yellow
     Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 1
-    Remove-Item -LiteralPath $TunnelLog -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TunnelOut -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TunnelErr -Force -ErrorAction SilentlyContinue
 
     $args = @("tunnel", "--url", "http://127.0.0.1:30120", "--no-autoupdate")
-    Start-Process -FilePath $cloudflared.Source -ArgumentList $args -RedirectStandardOutput $TunnelLog -RedirectStandardError $TunnelLog -WindowStyle Hidden
+    Start-Process -FilePath $cloudflared.Source -ArgumentList $args -RedirectStandardOutput $TunnelOut -RedirectStandardError $TunnelErr -WindowStyle Hidden
 
     $tunnel = $null
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 750
-        if (Test-Path -LiteralPath $TunnelLog) {
-            $log = Get-Content -LiteralPath $TunnelLog -Raw -ErrorAction SilentlyContinue
-            $m = [regex]::Match($log, 'https://[a-z0-9-]+\.trycloudflare\.com')
-            if ($m.Success) {
-                $tunnel = $m.Value
-                break
-            }
+        $log = ""
+        if (Test-Path -LiteralPath $TunnelOut) {
+            $log += Get-Content -LiteralPath $TunnelOut -Raw -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $TunnelErr) {
+            $log += [Environment]::NewLine
+            $log += Get-Content -LiteralPath $TunnelErr -Raw -ErrorAction SilentlyContinue
+        }
+        $m = [regex]::Match($log, 'https://[a-z0-9-]+\.trycloudflare\.com')
+        if ($m.Success) {
+            $tunnel = $m.Value
+            break
         }
     }
 
