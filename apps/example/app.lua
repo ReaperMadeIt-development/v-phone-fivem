@@ -434,6 +434,50 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
         voiceRooms[key] = nil
     end
 
+
+    function ReaperLinkVoiceAbortMixed(callId, reason)
+        callId = tonumber(callId)
+        if not callId then return end
+        local key = tostring(callId)
+
+        for src in pairs(mixedMembers[key] or {}) do
+            if GetPlayerName(src) then
+                TriggerClientEvent('v-phone:physical:voiceMode', src, {
+                    enabled = false, callId = callId, fallback = true,
+                })
+            end
+        end
+        mixedMembers[key] = nil
+
+        local room = voiceRooms[key]
+        if room then
+            -- Tell physical browsers first, through the normal mirrored event queue, so they
+            -- stop their microphone and show that the call fell back to the PC/headset path.
+            for id in pairs(room) do
+                local ep = voiceById[id]
+                if ep and ep.kind == 'physical' and ep.token then
+                    local s = sessions[ep.token]
+                    if s then
+                        s.seq = s.seq + 1
+                        s.events[#s.events + 1] = {
+                            seq = s.seq,
+                            message = {
+                                action = 'reaperlink:voiceFallback',
+                                reason = tostring(reason or 'peer-unavailable'),
+                            },
+                        }
+                        if #s.events > MAX_EVENT_QUEUE then table.remove(s.events, 1) end
+                    end
+                end
+            end
+
+            local ids = {}
+            for id in pairs(room) do ids[#ids + 1] = id end
+            for _, id in ipairs(ids) do removeVoiceEndpoint(id, false, false) end
+        end
+        voiceRooms[key] = nil
+    end
+
     local function createSession(src, identity)
         local old = sessionByPlayer[src]
         if old then endSession(old, true) end
@@ -623,6 +667,19 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
         end
     end)
 
+
+    RegisterNetEvent('v-phone:physical:gameVoiceFailed', function(callId, reason)
+        local src = source
+        callId = tonumber(callId)
+        local state = bridgeState(src)
+        if not callId or not state or tonumber(state.id) ~= callId then return end
+        if roomHasPhysical(callId) then
+            print(('[ReaperLink Voice] mixed call %s fell back to FiveM audio: %s'):format(
+                tostring(callId), tostring(reason or 'game microphone unavailable')))
+            ReaperLinkVoiceAbortMixed(callId, reason)
+        end
+    end)
+
     AddEventHandler('playerDropped', function()
         local src = source
         local gameVoice = gameVoiceBySource[src]
@@ -790,7 +847,10 @@ document.getElementById('pair').addEventListener('submit',function(e){
         if voicePollToken then
             local s = sessionForToken(voicePollToken)
             if not s then sendJson(res, 403, { error = 'session' }); return end
-            local ep = s.voiceId and voiceById[s.voiceId] or nil
+            if not s.voiceJoined or not s.voiceId then
+                sendJson(res, 409, { error = 'voice-ended' }); return
+            end
+            local ep = voiceById[s.voiceId]
             if ep and ep.kind == 'physical' then ep.lastSeen = GetGameTimer() end
             local q = voiceQueue(voicePollToken)
             local afterSeq = tonumber(voiceAfter) or 0
@@ -1186,6 +1246,8 @@ else
         if mixedVoiceCallId and not mixedVoiceSelfPhysical
             and type(ReaperLinkCallIsActive) == 'function'
             and ReaperLinkCallIsActive(mixedVoiceCallId) then
+            TriggerServerEvent('v-phone:physical:gameVoiceFailed',
+                mixedVoiceCallId, tostring(data and data.error or 'microphone-unavailable'))
             pcall(function() exports['v-voice']:PhoneCallStart(mixedVoiceCallId) end)
         end
         cb({ ok = true })
