@@ -1116,10 +1116,14 @@ else
         if data.enabled == true and callId then
             mixedVoiceCallId = callId
             mixedVoiceSelfPhysical = data.selfPhysical == true
-            pcall(function() exports['v-voice']:PhoneCallEnd(callId) end)
             if mixedVoiceSelfPhysical then
+                -- The physical browser has already opened its microphone before it can join
+                -- the room, so this end may leave Mumble immediately.
+                pcall(function() exports['v-voice']:PhoneCallEnd(callId) end)
                 nativeSendNUIMessage({ action = 'reaperlink:gameVoiceStop', callId = callId })
             else
+                -- Keep the ordinary FiveM audio alive until CEF has actually obtained mic
+                -- permission. reaperVoiceGameJoin below performs the handoff only after that.
                 nativeSendNUIMessage({
                     action = 'reaperlink:gameVoiceStart',
                     callId = callId,
@@ -1151,6 +1155,9 @@ else
         if not callId or callId ~= mixedVoiceCallId or mixedVoiceSelfPhysical then
             cb({ error = 'voice-mode' }); return
         end
+        -- getUserMedia succeeded before this callback was made. Switch away from the
+        -- normal pma call channel only now, so a denied microphone never creates silence.
+        pcall(function() exports['v-voice']:PhoneCallEnd(callId) end)
         TriggerServerEvent('v-phone:physical:gameVoiceJoin', callId)
         cb({ ok = true })
     end)
@@ -1174,6 +1181,13 @@ else
     RegisterNUICallback('reaperVoiceGameError', function(data, cb)
         print(('[ReaperLink Voice] game audio error: %s'):format(
             tostring(data and data.error or 'unknown')))
+        -- Mixed WebRTC failed on this FiveM client. Keep/recover the ordinary call audio
+        -- instead of leaving the player with a connected call and no sound.
+        if mixedVoiceCallId and not mixedVoiceSelfPhysical
+            and type(ReaperLinkCallIsActive) == 'function'
+            and ReaperLinkCallIsActive(mixedVoiceCallId) then
+            pcall(function() exports['v-voice']:PhoneCallStart(mixedVoiceCallId) end)
+        end
         cb({ ok = true })
     end)
 
