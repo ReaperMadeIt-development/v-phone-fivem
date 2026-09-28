@@ -31,6 +31,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate installer syntax
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ".\installer\ReaperLink-Test-Installer.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw "Installer PowerShell syntax validation failed."
+          }
+          Write-Host "Installer syntax OK"
+
       - name: Build package
         shell: powershell
         run: |
