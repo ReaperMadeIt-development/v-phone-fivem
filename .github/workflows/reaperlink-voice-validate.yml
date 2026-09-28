@@ -16,11 +16,11 @@ concurrency:
 jobs:
   validate:
     name: ${{ matrix.slot }} - ${{ matrix.task }}
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: [self-hosted, Windows, X64, org-shared]
     timeout-minutes: 20
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 9
       matrix:
         include:
           - slot: Terminator
@@ -66,11 +66,45 @@ jobs:
           if-no-files-found: error
 
 
+  qa:
+    name: ${{ matrix.persona }} - ${{ matrix.task }}
+    runs-on: [self-hosted, Windows, X64, testing, qa]
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - persona: CHER
+            task: source-gate
+          - persona: JANET
+            task: safety-gate
+          - persona: MADONNA
+            task: payload-gate
+          - persona: TINA
+            task: compile-gate
+          - persona: BLONDIE
+            task: distribution-gate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ReaperLink installer QA
+        shell: powershell
+        run: |
+          .\.github\scripts\reaperlink-installer-qa.ps1 -Task "${{ matrix.task }}" -Persona "${{ matrix.persona }}"
+
+      - name: Upload QA report
+        uses: actions/upload-artifact@v4
+        with:
+          name: reaperlink-installer-qa-${{ matrix.task }}-${{ runner.name }}
+          path: .installer-qa\${{ matrix.task }}.txt
+          if-no-files-found: error
+
+
   package:
     name: Build ReaperLink Setup EXE
-    needs: validate
-    if: ${{ always() }}
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: [self-hosted, Windows, X64, org-shared]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
