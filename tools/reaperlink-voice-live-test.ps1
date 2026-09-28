@@ -100,8 +100,7 @@ Say "PASS  clean physical bridge (1 HTTP handler / 1 pair handler)" Green
 $cloudflared = Get-Command cloudflared -ErrorAction SilentlyContinue
 if ($cloudflared) {
     Say "Starting HTTPS quick tunnel..." Yellow
-    Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 1
+    # Do not kill other cloudflared processes; another ReaperMadeIt project may be using one.
     Remove-Item -LiteralPath $TunnelOut -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $TunnelErr -Force -ErrorAction SilentlyContinue
 
