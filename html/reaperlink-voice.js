@@ -35,8 +35,92 @@
   let polling = false;
   let stopping = false;
   let muted = false;
+  let speakerMode = false;
+  let lastOutputRoute = 'auto';
   const peers = new Map();
   const audios = new Map();
+
+  function audioSessionType() {
+    try {
+      if (!navigator.audioSession || typeof navigator.audioSession.type === 'undefined') return null;
+      return navigator.audioSession.type;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function setAudioSessionForRoute() {
+    try {
+      if (!navigator.audioSession || typeof navigator.audioSession.type === 'undefined') return false;
+      // "play-and-record" is the browser hint closest to a normal handset/receiver call.
+      // "playback" requests media-style output, which mobile OSes normally send to speaker.
+      navigator.audioSession.type = speakerMode ? 'playback' : 'play-and-record';
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function outputDevices() {
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') return [];
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      return all.filter(device => device && device.kind === 'audiooutput');
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function pickOutputDevice(devices) {
+    const labelled = devices.filter(device => device.deviceId);
+    if (!labelled.length) return null;
+
+    const speakerRx = /(speakerphone|loudspeaker|speaker)/i;
+    const receiverRx = /(earpiece|receiver|handset|communications?|phone)/i;
+    const wanted = speakerMode ? speakerRx : receiverRx;
+
+    let match = labelled.find(device => wanted.test(device.label || ''));
+    if (!match && !speakerMode) {
+      // Some Android builds expose the communications route only as "default".
+      match = labelled.find(device => /default|communications?/i.test(device.label || ''));
+    }
+    return match || null;
+  }
+
+  async function applyAudioRoute(audio) {
+    if (!audio) return 'none';
+
+    setAudioSessionForRoute();
+
+    if (typeof audio.setSinkId === 'function') {
+      const devices = await outputDevices();
+      const selected = pickOutputDevice(devices);
+      try {
+        if (selected) {
+          await audio.setSinkId(selected.deviceId);
+          lastOutputRoute = selected.label || (speakerMode ? 'speaker' : 'receiver');
+          return lastOutputRoute;
+        }
+
+        // Reset to the system/default communications route when no explicit receiver is exposed.
+        await audio.setSinkId('default');
+        lastOutputRoute = speakerMode ? 'system speaker' : 'system receiver';
+        return lastOutputRoute;
+      } catch (_) {
+        // Keep playing through the browser-selected route.
+      }
+    }
+
+    lastOutputRoute = speakerMode ? 'system speaker' : 'system receiver';
+    return lastOutputRoute;
+  }
+
+  async function applyRouteToAllAudio() {
+    setAudioSessionForRoute();
+    const jobs = [];
+    for (const audio of audios.values()) jobs.push(applyAudioRoute(audio));
+    await Promise.allSettled(jobs);
+  }
 
   function bytesToBase64Url(bytes) {
     let binary = '';
@@ -88,9 +172,12 @@
 
     const el = document.createElement('div');
     el.id = 'reaperlink-voice-status';
-    el.innerHTML = '<span class="dot"></span><span class="label">ReaperLink Voice</span><button type="button" class="mute">Mute</button>';
+    el.innerHTML = '<span class="dot"></span><span class="label">ReaperLink Voice</span><button type="button" class="mute">Mute</button><button type="button" class="speaker">Speaker</button>';
     document.body.appendChild(el);
     el.querySelector('.mute').addEventListener('click', () => setMuted(!muted));
+    el.querySelector('.speaker').addEventListener('click', () => {
+      setSpeakerMode(!speakerMode).catch(() => {});
+    });
   }
 
   function setStatus(text, state = 'warn', show = true) {
@@ -111,6 +198,28 @@
     const btn = el && el.querySelector('.mute');
     if (btn) btn.textContent = muted ? 'Unmute' : 'Mute';
     return muted;
+  }
+
+  async function setSpeakerMode(value) {
+    speakerMode = !!value;
+    ensureUi();
+
+    const el = document.getElementById('reaperlink-voice-status');
+    const btn = el && el.querySelector('.speaker');
+    if (btn) {
+      btn.textContent = speakerMode ? 'Speaker On' : 'Speaker';
+      btn.setAttribute('aria-pressed', speakerMode ? 'true' : 'false');
+    }
+
+    await applyRouteToAllAudio();
+
+    if (activeCallId || voiceId) {
+      setStatus(
+        speakerMode ? 'ReaperLink Voice · speaker' : 'ReaperLink Voice · receiver',
+        'live'
+      );
+    }
+    return speakerMode;
   }
 
   function closePeer(peerId) {
@@ -182,6 +291,7 @@
         audios.set(peerId, audio);
       }
       audio.srcObject = event.streams[0] || new MediaStream([event.track]);
+      applyAudioRoute(audio).catch(() => {});
       audio.play().catch(() => {
         setStatus('Tap phone once to enable call audio', 'warn');
       });
@@ -307,6 +417,7 @@
 
     try {
       setStatus('Requesting phone microphone…', 'warn');
+      setAudioSessionForRoute();
       localStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation:true,
@@ -316,6 +427,7 @@
         video:false
       });
       setMuted(muted);
+      setSpeakerMode(speakerMode).catch(() => {});
 
       const r = await nativeFetch(`${base}/voice/join/${token}`, {
         cache:'no-store', credentials:'omit'
@@ -387,6 +499,7 @@
     let recorder = null;
     try {
       setStatus('Solo test · requesting microphone…', 'warn');
+      setAudioSessionForRoute();
       stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation:true,
@@ -413,11 +526,9 @@
       if (recorder.state !== 'inactive') recorder.stop();
       await stopped;
 
-      for (const track of stream.getTracks()) {
-        try { track.stop(); } catch (_) {}
-      }
-      stream = null;
-
+      // Keep the capture stream alive during playback. On mobile this helps the OS
+      // keep the audio session in handset/communications mode instead of immediately
+      // switching the recording back to the loudspeaker media route.
       if (!chunks.length) throw new Error('no recorded audio');
       const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
       const url = URL.createObjectURL(blob);
@@ -426,9 +537,16 @@
       audio.src = url;
       audio.style.display = 'none';
       document.body.appendChild(audio);
+      await applyAudioRoute(audio).catch(() => {});
 
       const cleanup = () => {
         try { URL.revokeObjectURL(url); audio.remove(); } catch (_) {}
+        if (stream) {
+          for (const track of stream.getTracks()) {
+            try { track.stop(); } catch (_) {}
+          }
+          stream = null;
+        }
         setTimeout(() => setStatus('', 'warn', false), 1800);
       };
       audio.onended = cleanup;
@@ -501,11 +619,16 @@
     stop: stopVoice,
     setMuted,
     toggleMute: () => setMuted(!muted),
+    setSpeakerMode,
+    toggleSpeaker: () => setSpeakerMode(!speakerMode),
     selfTest,
     state: () => ({
       callId:activeCallId,
       voiceId,
       muted,
+      speakerMode,
+      outputRoute:lastOutputRoute,
+      audioSession:audioSessionType(),
       peers:peers.size,
       secure:window.isSecureContext
     })
