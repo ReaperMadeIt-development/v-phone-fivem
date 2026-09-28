@@ -67,47 +67,108 @@ jobs:
 
 
   package:
-    name: Build distributable tester ZIP
+    name: Build ReaperLink Setup EXE
     needs: validate
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate installer syntax
+      - name: Validate installer engine syntax
         shell: powershell
         run: |
           $tokens = $null
           $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path ".\installer\ReaperLink-Test-Installer.ps1"),
+            (Resolve-Path ".\installer\ReaperLink-InstallCore.ps1"),
             [ref]$tokens,
             [ref]$errors
           ) | Out-Null
           if ($errors.Count) {
             $errors | ForEach-Object { Write-Error $_.Message }
-            throw "Installer PowerShell syntax validation failed."
+            throw "ReaperLink install engine syntax validation failed."
           }
-          Write-Host "Installer syntax OK"
+          Write-Host "Install engine syntax OK"
 
-      - name: Build self-contained tester package
+      - name: Ensure Inno Setup compiler
+        id: inno
         shell: powershell
         run: |
-          .\tools\build-reaperlink-tester-package.ps1
+          $candidates = @(
+            "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
-      - name: Verify package
+          if (-not $iscc) {
+            $winget = Get-Command winget -ErrorAction SilentlyContinue
+            if ($winget) {
+              & $winget.Source install --id JRSoftware.InnoSetup -e --accept-package-agreements --accept-source-agreements --silent
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "winget returned $LASTEXITCODE while installing Inno Setup."
+              }
+            }
+          }
+
+          if (-not $iscc) {
+            $candidates = @(
+              "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+            )
+            $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          }
+
+          if (-not $iscc) {
+            $choco = Get-Command choco -ErrorAction SilentlyContinue
+            if ($choco) {
+              & $choco.Source install innosetup -y --no-progress
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Chocolatey returned $LASTEXITCODE while installing Inno Setup."
+              }
+            }
+          }
+
+          if (-not $iscc) {
+            $candidates = @(
+              "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+            )
+            $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          }
+
+          if (-not $iscc) {
+            throw "Inno Setup 6 compiler (ISCC.exe) is not available on this runner."
+          }
+
+          "iscc=$iscc" >> $env:GITHUB_OUTPUT
+          Write-Host "ISCC: $iscc"
+
+      - name: Compile proper Windows setup wizard
         shell: powershell
         run: |
-          $zip = ".\dist\ReaperLink-Tester-Package.zip"
-          if (-not (Test-Path -LiteralPath $zip)) { throw "Package ZIP missing." }
-          $size = (Get-Item -LiteralPath $zip).Length
-          if ($size -lt 100000) { throw "Package ZIP is unexpectedly small: $size bytes" }
-          Write-Host "Package OK: $size bytes"
+          New-Item -ItemType Directory -Force ".\dist" | Out-Null
+          & "${{ steps.inno.outputs.iscc }}" ".\installer\ReaperLink-Setup.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compiler failed with exit code $LASTEXITCODE"
+          }
 
-      - name: Upload tester package
+      - name: Verify setup executable
+        shell: powershell
+        run: |
+          $exe = ".\dist\ReaperLink-Voice-Tester-Setup.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "ReaperLink setup EXE was not produced."
+          }
+          $size = (Get-Item -LiteralPath $exe).Length
+          if ($size -lt 1000000) {
+            throw "Setup EXE is unexpectedly small: $size bytes"
+          }
+          Write-Host "Setup EXE OK: $size bytes"
+
+      - name: Upload ReaperLink setup wizard
         uses: actions/upload-artifact@v4
         with:
-          name: ReaperLink-Tester-Package
-          path: dist/ReaperLink-Tester-Package.zip
+          name: ReaperLink-Voice-Tester-Setup
+          path: dist/ReaperLink-Voice-Tester-Setup.exe
           if-no-files-found: error
           retention-days: 14
