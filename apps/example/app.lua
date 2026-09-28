@@ -179,9 +179,3062 @@ small{display:block;color:#777;margin-top:14px;line-height:1.35}
     local function reaperLinkPublicBase()
         local base = tostring(GetConvar('reaperlink_public_url', '') or '')
         base = base:gsub('^%s+', '')
-        base = base:gsub('%s+$', '')
-        base = base:gsub('/+$', '')
+        base = base:gsub('%s+
+    local function newPairCode()
+        for _ = 1, 60 do
+            local code = tostring(math.random(100000, 999999))
+            if not pairings[code] then return code end
+        end
+        return tostring(math.random(1000000, 9999999))
+    end
+
+    local function identityOf(src)
+        if Core and Core.GetPlayer then
+            local ok, p = pcall(Core.GetPlayer, src)
+            if ok and p then
+                local id = p.citizenid or p.identifier or p.charid or p.id
+                if id ~= nil and tostring(id) ~= '' then return tostring(id) end
+            end
+        end
+
+        for _, identifier in ipairs(GetPlayerIdentifiers(src) or {}) do
+            if identifier:sub(1, 8) == 'license:' then return identifier end
+        end
+        return ('source:%s'):format(tostring(src))
+    end
+
+    local function endSession(token, tellClient)
+        local s = sessions[token]
+        if not s then return end
+        voiceLeave(token, true)
+        sessions[token] = nil
+        rate[token] = nil
+
+        if sessionByPlayer[s.source] == token then
+            sessionByPlayer[s.source] = nil
+        end
+
+        for id, req in pairs(pending) do
+            if req.token == token then
+                sendJson(req.response, 410, { error = 'session-ended' })
+                pending[id] = nil
+            end
+        end
+
+        for key in pairs(chunks) do
+            if key:sub(1, #token + 1) == token .. ':' then chunks[key] = nil end
+        end
+
+        if tellClient and GetPlayerName(s.source) then
+            TriggerClientEvent('v-phone:physical:session', s.source, false)
+        end
+    end
+
+    local function sessionForToken(token, touch)
+        local s = sessions[token]
+        if not s then return nil, 'nosession' end
+        if not GetPlayerName(s.source) then
+            endSession(token, false)
+            return nil, 'offline'
+        end
+        if identityOf(s.source) ~= s.identity then
+            endSession(token, true)
+            return nil, 'character'
+        end
+        local now = os.time()
+        if now - (s.lastSeen or s.created) > SESSION_IDLE_TTL then
+            endSession(token, true)
+            return nil, 'expired'
+        end
+        if touch ~= false then s.lastSeen = now end
+        return s
+    end
+
+    local function createSession(src, identity)
+        local old = sessionByPlayer[src]
+        if old then endSession(old, true) end
+
+        local token
+        repeat token = randomToken() until not sessions[token]
+
+        local now = os.time()
+        sessions[token] = {
+            source = src,
+            identity = identity,
+            created = now,
+            lastSeen = now,
+            seq = 0,
+            events = {},
+        }
+        sessionByPlayer[src] = token
+        return token, sessions[token]
+    end
+
+    local function allowRequest(token)
+        local now = GetGameTimer()
+        local r = rate[token]
+        if not r or now - r.started >= 10000 then
+            rate[token] = { started = now, count = 1 }
+            return true
+        end
+        r.count = r.count + 1
+        return r.count <= 120
+    end
+
+    local function addMirrorEvent(src, message)
+        local token = sessionByPlayer[src]
+        if not token then return end
+        local s = sessionForToken(token, false)
+        if not s or type(message) ~= 'table' then return end
+
+        -- The paired FiveM client is authoritative for which call this browser may join.
+        -- A browser never supplies an arbitrary call id.
+        if message.action == 'call' then
+            local nextCall = type(message.call) == 'table' and message.call or nil
+            local nextId = nextCall and nextCall.state == 'active' and tonumber(nextCall.id) or nil
+            if s.voiceCallId ~= nextId then
+                if s.voiceJoined then voiceLeave(token, true) end
+                s.voiceCallId = nextId
+            end
+        end
+
+        s.seq = s.seq + 1
+        s.events[#s.events + 1] = { seq = s.seq, message = message }
+        if #s.events > MAX_EVENT_QUEUE then table.remove(s.events, 1) end
+    end
+
+    local function mimeFor(path)
+        local ext = path:match('%.([%w]+)$')
+        ext = ext and ext:lower() or ''
+        local map = {
+            html = 'text/html; charset=utf-8',
+            css = 'text/css; charset=utf-8',
+            js = 'application/javascript; charset=utf-8',
+            json = 'application/json; charset=utf-8',
+            svg = 'image/svg+xml',
+            png = 'image/png',
+            jpg = 'image/jpeg',
+            jpeg = 'image/jpeg',
+            webp = 'image/webp',
+            gif = 'image/gif',
+            wav = 'audio/wav',
+            ogg = 'audio/ogg',
+            mp3 = 'audio/mpeg',
+            webm = 'video/webm',
+        }
+        return map[ext] or 'application/octet-stream'
+    end
+
+    local function safeStaticPath(path)
+        if type(path) ~= 'string' or path == '' then return nil end
+        if path:find('..', 1, true) or path:find('\\', 1, true) then return nil end
+        if path:sub(1, 5) == 'html/' or path:sub(1, 5) == 'apps/' or path:sub(1, 7) == 'sounds/' then
+            return path
+        end
+        return nil
+    end
+
+    RegisterNetEvent('v-phone:physical:pairRequest', function()
+        local src = source
+        if not src or src <= 0 or not GetPlayerName(src) then return end
+
+        local old = pairByPlayer[src]
+        if old then pairings[old] = nil end
+
+        local identity = identityOf(src)
+        local code = newPairCode()
+        pairings[code] = {
+            source = src,
+            identity = identity,
+            expires = os.time() + PAIR_TTL,
+        }
+        pairByPlayer[src] = code
+
+        local publicBase = reaperLinkPublicBase()
+        local pairUrl = publicBase ~= '' and (publicBase .. '/pair/' .. code) or ''
+        TriggerClientEvent('v-phone:physical:pairCode', src, code, PAIR_TTL, pairUrl, publicBase ~= '')
+        if publicBase == '' then
+            print('[ReaperLink] WARNING: reaperlink_public_url is not set. QR pairing cannot be generated.')
+        end
+        print(('[v-phone] physical pairing code %s created for %s (%d)'):format(
+            code, GetPlayerName(src) or 'player', src))
+    end)
+
+    RegisterNetEvent('v-phone:physical:nuiReply', function(requestId, result)
+        local src = source
+        local id = tostring(requestId or '')
+        local req = pending[id]
+        if not req or req.source ~= src then return end
+
+        local s = sessionForToken(req.token, false)
+        pending[id] = nil
+        if not s then
+            sendJson(req.response, 410, { error = 'session-ended' })
+            return
+        end
+        if result == nil then result = {} end
+        sendJson(req.response, 200, result)
+    end)
+
+    RegisterNetEvent('v-phone:physical:nuiMessage', function(message)
+        addMirrorEvent(source, message)
+    end)
+
+    AddEventHandler('playerDropped', function()
+        local src = source
+        local code = pairByPlayer[src]
+        if code then pairings[code] = nil end
+        pairByPlayer[src] = nil
+
+        local token = sessionByPlayer[src]
+        if token then endSession(token, false) end
+    end)
+
+    AddEventHandler('onResourceStop', function(resource)
+        if resource ~= RES then return end
+        for token in pairs(sessions) do endSession(token, false) end
+    end)
+
+    CreateThread(function()
+        while true do
+            Wait(30000)
+            local now, tick = os.time(), GetGameTimer()
+
+            for code, entry in pairs(pairings) do
+                if not entry or entry.expires <= now or not GetPlayerName(entry.source) then
+                    if entry and pairByPlayer[entry.source] == code then pairByPlayer[entry.source] = nil end
+                    pairings[code] = nil
+                end
+            end
+
+            for token, s in pairs(sessions) do
+                if not s or not GetPlayerName(s.source)
+                    or now - (s.lastSeen or s.created) > SESSION_IDLE_TTL
+                    or identityOf(s.source) ~= s.identity then
+                    endSession(token, s and GetPlayerName(s.source) ~= nil)
+                end
+            end
+
+            for key, set in pairs(chunks) do
+                if not set or set.expires <= tick then chunks[key] = nil end
+            end
+        end
+    end)
+
+    SetHttpHandler(function(req, res)
+        local path = tostring(req.path or '/')
+
+        if req.method ~= 'GET' then
+            send(res, 405, 'text/plain; charset=utf-8', 'GET only')
+            return
+        end
+
+        if path == '/' or path == '/physical' or path == '/physical/' then
+            local base = '/' .. RES .. '/physical'
+            sendHtml(res, ([[
+<h1>ReaperLink</h1>
+<p class="muted">In FiveM, type <b>/physicalpair</b>. Enter the six-digit code below.</p>
+<form id="pair"><input id="code" inputmode="numeric" maxlength="7" placeholder="PAIR CODE" autocomplete="one-time-code"><button type="submit">Pair this phone</button></form>
+<p id="status" class="muted"></p>
+<small>The code is one-time use and expires after ten minutes. The paired browser only reaches the same v-phone callbacks your character already has.</small>
+<script>
+document.getElementById('pair').addEventListener('submit',function(e){
+  e.preventDefault();
+  var c=document.getElementById('code').value.replace(/\D/g,'');
+  if(c) location.href=']] .. base .. [[/pair/'+c;
+});
+</script>]]))
+            return
+        end
+
+        local pairCode = path:match('^/physical/pair/(%d+)$')
+        if pairCode then
+            local entry = pairings[pairCode]
+            if not entry or entry.expires <= os.time() or not GetPlayerName(entry.source) then
+                sendHtml(res, '<h1>Pairing expired</h1><p class="bad">Run <b>/physicalpair</b> again in FiveM.</p>', 403)
+                return
+            end
+            if identityOf(entry.source) ~= entry.identity then
+                pairings[pairCode] = nil
+                if pairByPlayer[entry.source] == pairCode then pairByPlayer[entry.source] = nil end
+                sendHtml(res, '<h1>Character changed</h1><p class="bad">Generate a new pairing code.</p>', 403)
+                return
+            end
+
+            pairings[pairCode] = nil
+            if pairByPlayer[entry.source] == pairCode then pairByPlayer[entry.source] = nil end
+
+            local token = createSession(entry.source, entry.identity)
+            TriggerClientEvent('v-phone:physical:session', entry.source, true)
+
+            local location = ('/%s/physical/ui/%s'):format(RES, token)
+            send(res, 302, 'text/plain; charset=utf-8', 'Pairing accepted', {
+                ['Location'] = location,
+            })
+            return
+        end
+
+        local voiceJoinToken = path:match('^/physical/voice/join/([%w_-]+)$')
+        if voiceJoinToken then
+            local s = sessionForToken(voiceJoinToken)
+            if not s or not s.voiceCallId then
+                sendJson(res, 409, { error = 'no-active-call' })
+                return
+            end
+
+            if not s.voiceId then
+                local id
+                repeat id = randomVoiceId() until not voiceById[id]
+                s.voiceId = id
+                voiceById[id] = voiceJoinToken
+            end
+
+            local callKey = tostring(s.voiceCallId)
+            local room = voiceRooms[callKey]
+            if not room then room = {}; voiceRooms[callKey] = room end
+
+            local peers = {}
+            for peerId in pairs(room) do
+                if peerId ~= s.voiceId then peers[#peers + 1] = peerId end
+            end
+
+            if not room[s.voiceId] then
+                room[s.voiceId] = true
+                s.voiceJoined = true
+                for peerId in pairs(room) do
+                    if peerId ~= s.voiceId then
+                        local peerToken = voiceById[peerId]
+                        if peerToken then
+                            voicePush(peerToken, { type = 'peer-join', peer = s.voiceId })
+                        end
+                    end
+                end
+            end
+
+            local q = voiceQueue(voiceJoinToken)
+            sendJson(res, 200, {
+                ok = true,
+                voiceId = s.voiceId,
+                callId = s.voiceCallId,
+                peers = peers,
+                seq = q.seq,
+            })
+            return
+        end
+
+        local voiceLeaveToken = path:match('^/physical/voice/leave/([%w_-]+)$')
+        if voiceLeaveToken then
+            local s = sessionForToken(voiceLeaveToken, false)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            voiceLeave(voiceLeaveToken, true)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voicePollToken, voiceAfter =
+            path:match('^/physical/voice/events/([%w_-]+)/(%d+)$')
+        if voicePollToken then
+            local s = sessionForToken(voicePollToken)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            local q = voiceQueue(voicePollToken)
+            local after = tonumber(voiceAfter) or 0
+            local events = {}
+            for _, entry in ipairs(q.events) do
+                if entry.seq > after then events[#events + 1] = entry end
+            end
+            sendJson(res, 200, { ok = true, seq = q.seq, events = events })
+            return
+        end
+
+        local voiceChunkToken, voiceRequestId, voiceChunkIndex, voiceChunkTotal, voicePiece =
+            path:match('^/physical/voice/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if voiceChunkToken then
+            local s = sessionForToken(voiceChunkToken)
+            if not s or not s.voiceJoined then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+            local idx, total = tonumber(voiceChunkIndex), tonumber(voiceChunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #voicePiece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+            local key = 'voice:' .. voiceChunkToken .. ':' .. voiceRequestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = voicePiece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voiceSendToken, voiceSendRequest, voicePeer =
+            path:match('^/physical/voice/send/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if voiceSendToken then
+            local s = sessionForToken(voiceSendToken)
+            if not s or not s.voiceJoined or not s.voiceCallId or not s.voiceId then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+
+            local key = 'voice:' .. voiceSendToken .. ':' .. voiceSendRequest
+            local set = chunks[key]
+            if not set then sendJson(res, 400, { error = 'missing-chunks' }); return end
+            local parts = {}
+            for i = 1, set.total do
+                if not set.parts[i] then sendJson(res, 400, { error = 'missing-chunk' }); return end
+                parts[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local decoded = b64urlDecode(table.concat(parts))
+            local ok, payload = pcall(json.decode, decoded)
+            if not ok or type(payload) ~= 'table' then
+                sendJson(res, 400, { error = 'signal' })
+                return
+            end
+
+            local peerToken = voiceById[voicePeer]
+            local peerSession = peerToken and sessionForToken(peerToken, false) or nil
+            if not peerSession or not peerSession.voiceJoined
+                or tostring(peerSession.voiceCallId or '') ~= tostring(s.voiceCallId) then
+                sendJson(res, 404, { error = 'peer' })
+                return
+            end
+
+            voicePush(peerToken, { type = 'signal', peer = s.voiceId, data = payload })
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local uiToken = path:match('^/physical/ui/([%w_-]+)/*$')
+        if uiToken then
+            local s = sessionForToken(uiToken)
+            if not s then
+                sendHtml(res, '<h1>Session ended</h1><p class="bad">Run <b>/physicalpair</b> again.</p>', 403)
+                return
+            end
+
+            local index = LoadResourceFile(RES, 'html/index.html')
+            if not index then
+                sendHtml(res, '<h1>Missing UI</h1><p class="bad">html/index.html could not be read.</p>', 500)
+                return
+            end
+
+            local root = ('/%s/physical'):format(RES)
+            local base = ('/%s/physical/files/%s/html/'):format(RES, uiToken)
+            local injectHead = ('<base href="%s"><meta name="referrer" content="no-referrer">'):format(base)
+            index = index:gsub('<head>', '<head>' .. injectHead, 1)
+
+            local voiceCfg = json.encode(reaperLinkVoiceBrowserConfig()):gsub('</', '<\\/')
+            local boot = ([[<script>
+window.__VPHONE_PHYSICAL__={token:"%s",base:"%s",resource:"%s",voice:%s};
+</script><script src="physical.js"></script>
+<script src="reaperlink-voice.js"></script>
+<script src="sdk.js"></script>]]):format(uiToken, root, RES, voiceCfg)
+
+            index = index:gsub('<script src="sdk%.js"></script>', boot, 1)
+            send(res, 200, 'text/html; charset=utf-8', index)
+            return
+        end
+
+        local staticToken, staticPath = path:match('^/physical/files/([%w_-]+)/(.+)$')
+        if staticToken and staticPath then
+            local s = sessionForToken(staticToken)
+            if not s then
+                send(res, 403, 'text/plain; charset=utf-8', 'Session ended')
+                return
+            end
+            staticPath = safeStaticPath(staticPath)
+            if not staticPath then
+                send(res, 400, 'text/plain; charset=utf-8', 'Bad path')
+                return
+            end
+            local data = LoadResourceFile(RES, staticPath)
+            if data == nil then
+                send(res, 404, 'text/plain; charset=utf-8', 'Not found')
+                return
+            end
+            send(res, 200, mimeFor(staticPath), data, {
+                ['Cache-Control'] = 'private, max-age=300',
+            })
+            return
+        end
+
+        local chunkToken, requestId, chunkIndex, chunkTotal, piece =
+            path:match('^/physical/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if chunkToken then
+            local s = sessionForToken(chunkToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+
+            local idx, total = tonumber(chunkIndex), tonumber(chunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #piece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+
+            local key = chunkToken .. ':' .. requestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = piece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local apiToken, requestId, callbackB64 =
+            path:match('^/physical/api/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if apiToken then
+            local s = sessionForToken(apiToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            if not allowRequest(apiToken) then
+                sendJson(res, 429, { error = 'rate' })
+                return
+            end
+            if pending[requestId] then
+                sendJson(res, 409, { error = 'duplicate' })
+                return
+            end
+
+            local key = apiToken .. ':' .. requestId
+            local set = chunks[key]
+            if not set then
+                sendJson(res, 400, { error = 'missing-body' })
+                return
+            end
+
+            local pieces = {}
+            for i = 1, set.total do
+                if not set.parts[i] then
+                    sendJson(res, 400, { error = 'missing-chunk', chunk = i })
+                    return
+                end
+                pieces[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local body = b64urlDecode(table.concat(pieces))
+            local callbackName = b64urlDecode(callbackB64)
+            if callbackName == '' or #callbackName > 96 then
+                sendJson(res, 400, { error = 'callback' })
+                return
+            end
+
+            local ok, data = pcall(json.decode, body ~= '' and body or '{}')
+            if not ok or type(data) ~= 'table' then data = {} end
+
+            pending[requestId] = {
+                source = s.source,
+                token = apiToken,
+                response = res,
+            }
+            TriggerClientEvent('v-phone:physical:invoke', s.source, requestId, callbackName, data)
+
+            SetTimeout(REQUEST_TTL_MS, function()
+                local waiting = pending[requestId]
+                if not waiting then return end
+                pending[requestId] = nil
+                sendJson(waiting.response, 504, { error = 'timeout', callback = callbackName })
+            end)
+            return
+        end
+
+        local eventToken, after = path:match('^/physical/events/([%w_-]+)/(%d+)$')
+        if eventToken then
+            local s = sessionForToken(eventToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            local last = tonumber(after) or 0
+            local out = {}
+            for _, entry in ipairs(s.events) do
+                if entry.seq > last then
+                    out[#out + 1] = entry
+                    if #out >= 64 then break end
+                end
+            end
+            sendJson(res, 200, {
+                ok = true,
+                seq = s.seq,
+                events = out,
+                player = GetPlayerName(s.source) or 'player',
+            })
+            return
+        end
+
+        local openToken = path:match('^/physical/open/([%w_-]+)$')
+        if openToken then
+            local s = sessionForToken(openToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            TriggerClientEvent('v-phone:physical:open', s.source)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local disconnectToken = path:match('^/physical/disconnect/([%w_-]+)$')
+        if disconnectToken then
+            local s = sessionForToken(disconnectToken, false)
+            if s then endSession(disconnectToken, true) end
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        send(res, 404, 'text/plain; charset=utf-8', 'Not found')
+    end)
+
+    print(('[v-phone] physical full bridge ready at /%s/physical'):format(RES))
+else
+    -- ══════════════════════════════════════════════════════════════
+    -- Physical phone bridge - client
+    -- ══════════════════════════════════════════════════════════════
+
+    -- This shared script loads BEFORE bridge/client/safety.lua. Capturing RegisterNUICallback
+    -- here means the later safety wrapper still does its normal exception/always-answer work,
+    -- while every final wrapped callback is also available to the paired physical browser.
+    local nativeRegisterNUICallback = RegisterNUICallback
+    local physicalCallbacks = {}
+    local physicalActive = false
+
+    function RegisterNUICallback(name, handler)
+        physicalCallbacks[tostring(name)] = handler
+        return nativeRegisterNUICallback(name, handler)
+    end
+
+    function PhysicalBridgeActive()
+        return physicalActive
+    end
+
+    function PhysicalInvokeNuiCallback(name, data, reply)
+        local handler = physicalCallbacks[tostring(name or '')]
+        if type(handler) ~= 'function' then
+            reply({ error = 'no-callback', callback = tostring(name or '') })
+            return
+        end
+
+        local answered = false
+        local function answer(result)
+            if answered then return end
+            answered = true
+            reply(result == nil and {} or result)
+        end
+
+        local ok, err = pcall(handler, type(data) == 'table' and data or {}, answer)
+        if not ok then
+            print(('[v-phone] physical callback %s raised: %s'):format(tostring(name), tostring(err)))
+            answer({ error = 'x' })
+        end
+    end
+
+    -- Mirror the same messages the stock client sends to CEF. When no real handset is paired,
+    -- the wrapper is one native call and a boolean check.
+    local nativeSendNUIMessage = SendNUIMessage
+    function SendNUIMessage(message)
+        local result = nativeSendNUIMessage(message)
+        if physicalActive and type(message) == 'table' then
+            TriggerServerEvent('v-phone:physical:nuiMessage', message)
+        end
+        return result
+    end
+
+    RegisterCommand('physicalpair', function()
+        TriggerServerEvent('v-phone:physical:pairRequest')
+    end, false)
+
+    RegisterNetEvent('v-phone:physical:pairCode', function(code, seconds, pairUrl, configured)
+        local msg = ('ReaperLink pairing code: %s (valid for %s seconds)'):format(
+            tostring(code), tostring(seconds or 600))
+        if type(pairUrl) == 'string' and pairUrl ~= '' then
+            msg = msg .. (' | %s'):format(pairUrl)
+        end
+        print(('[ReaperLink] %s'):format(msg))
+
+        if GetResourceState('chat') == 'started' then
+            TriggerEvent('chat:addMessage', {
+                color = { 200, 205, 212 },
+                multiline = true,
+                args = { 'ReaperLink', msg }
+            })
+        end
+
+        CreateThread(function()
+            ExecuteCommand('phone open')
+            Wait(180)
+            nativeSendNUIMessage({
+                action = 'reaperlink:pairing',
+                code = tostring(code),
+                seconds = tonumber(seconds) or 600,
+                url = type(pairUrl) == 'string' and pairUrl or '',
+                configured = configured == true,
+            })
+        end)
+    end)
+
+    RegisterNetEvent('v-phone:physical:session', function(active)
+        physicalActive = active == true
+        if not physicalActive then return end
+
+        -- Re-open once after pairing so the new browser receives a complete action=open payload
+        -- even when the in-game handset was already open before the session existed.
+        CreateThread(function()
+            ExecuteCommand('phone close')
+            Wait(150)
+            ExecuteCommand('phone open')
+        end)
+    end)
+
+    RegisterNetEvent('v-phone:physical:open', function()
+        ExecuteCommand('phone open')
+    end)
+
+    RegisterNetEvent('v-phone:physical:invoke', function(requestId, callbackName, data)
+        -- The server only emits this event for a validated live physical session. Do not gate
+        -- it on the local mirror flag: the first browser callback can arrive in the same few
+        -- milliseconds as the session-on event, and event ordering across the HTTP/client paths
+        -- should not turn the phone's boot request into a false "session" error.
+        if type(PhysicalInvokeNuiCallback) ~= 'function' then
+            TriggerServerEvent('v-phone:physical:nuiReply', requestId, { error = 'bridge' })
+            return
+        end
+
+        PhysicalInvokeNuiCallback(callbackName, data, function(result)
+            TriggerServerEvent('v-phone:physical:nuiReply', requestId, result)
+        end)
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- Original SDK example - still off by default
+-- ══════════════════════════════════════════════════════════════
+if not (Config and Config.SdkExample) then return end
+
+PhoneApp {
+    id       = 'example',
+    label    = 'Example',
+    icon     = 'note',
+    category = 'utilities',
+    desc     = 'The worked example: a folder dropped into apps/ and nothing else.',
+    developer = 'iFruit SDK',
+    version  = '2.0.0',
+    accent   = '#0A84FF',
+    permissions = { 'storage', 'contacts', 'photos', 'location', 'notifications' },
+    features = { 'Persistent data', 'Native pickers', 'Quick actions', 'Live lifecycle' },
+    keywords = { 'example', 'sdk', 'developer' },
+    optional = true,
+}
+, '')
+        base = base:gsub('/+
+    local function newPairCode()
+        for _ = 1, 60 do
+            local code = tostring(math.random(100000, 999999))
+            if not pairings[code] then return code end
+        end
+        return tostring(math.random(1000000, 9999999))
+    end
+
+    local function identityOf(src)
+        if Core and Core.GetPlayer then
+            local ok, p = pcall(Core.GetPlayer, src)
+            if ok and p then
+                local id = p.citizenid or p.identifier or p.charid or p.id
+                if id ~= nil and tostring(id) ~= '' then return tostring(id) end
+            end
+        end
+
+        for _, identifier in ipairs(GetPlayerIdentifiers(src) or {}) do
+            if identifier:sub(1, 8) == 'license:' then return identifier end
+        end
+        return ('source:%s'):format(tostring(src))
+    end
+
+    local function endSession(token, tellClient)
+        local s = sessions[token]
+        if not s then return end
+        voiceLeave(token, true)
+        sessions[token] = nil
+        rate[token] = nil
+
+        if sessionByPlayer[s.source] == token then
+            sessionByPlayer[s.source] = nil
+        end
+
+        for id, req in pairs(pending) do
+            if req.token == token then
+                sendJson(req.response, 410, { error = 'session-ended' })
+                pending[id] = nil
+            end
+        end
+
+        for key in pairs(chunks) do
+            if key:sub(1, #token + 1) == token .. ':' then chunks[key] = nil end
+        end
+
+        if tellClient and GetPlayerName(s.source) then
+            TriggerClientEvent('v-phone:physical:session', s.source, false)
+        end
+    end
+
+    local function sessionForToken(token, touch)
+        local s = sessions[token]
+        if not s then return nil, 'nosession' end
+        if not GetPlayerName(s.source) then
+            endSession(token, false)
+            return nil, 'offline'
+        end
+        if identityOf(s.source) ~= s.identity then
+            endSession(token, true)
+            return nil, 'character'
+        end
+        local now = os.time()
+        if now - (s.lastSeen or s.created) > SESSION_IDLE_TTL then
+            endSession(token, true)
+            return nil, 'expired'
+        end
+        if touch ~= false then s.lastSeen = now end
+        return s
+    end
+
+    local function createSession(src, identity)
+        local old = sessionByPlayer[src]
+        if old then endSession(old, true) end
+
+        local token
+        repeat token = randomToken() until not sessions[token]
+
+        local now = os.time()
+        sessions[token] = {
+            source = src,
+            identity = identity,
+            created = now,
+            lastSeen = now,
+            seq = 0,
+            events = {},
+        }
+        sessionByPlayer[src] = token
+        return token, sessions[token]
+    end
+
+    local function allowRequest(token)
+        local now = GetGameTimer()
+        local r = rate[token]
+        if not r or now - r.started >= 10000 then
+            rate[token] = { started = now, count = 1 }
+            return true
+        end
+        r.count = r.count + 1
+        return r.count <= 120
+    end
+
+    local function addMirrorEvent(src, message)
+        local token = sessionByPlayer[src]
+        if not token then return end
+        local s = sessionForToken(token, false)
+        if not s or type(message) ~= 'table' then return end
+
+        -- The paired FiveM client is authoritative for which call this browser may join.
+        -- A browser never supplies an arbitrary call id.
+        if message.action == 'call' then
+            local nextCall = type(message.call) == 'table' and message.call or nil
+            local nextId = nextCall and nextCall.state == 'active' and tonumber(nextCall.id) or nil
+            if s.voiceCallId ~= nextId then
+                if s.voiceJoined then voiceLeave(token, true) end
+                s.voiceCallId = nextId
+            end
+        end
+
+        s.seq = s.seq + 1
+        s.events[#s.events + 1] = { seq = s.seq, message = message }
+        if #s.events > MAX_EVENT_QUEUE then table.remove(s.events, 1) end
+    end
+
+    local function mimeFor(path)
+        local ext = path:match('%.([%w]+)$')
+        ext = ext and ext:lower() or ''
+        local map = {
+            html = 'text/html; charset=utf-8',
+            css = 'text/css; charset=utf-8',
+            js = 'application/javascript; charset=utf-8',
+            json = 'application/json; charset=utf-8',
+            svg = 'image/svg+xml',
+            png = 'image/png',
+            jpg = 'image/jpeg',
+            jpeg = 'image/jpeg',
+            webp = 'image/webp',
+            gif = 'image/gif',
+            wav = 'audio/wav',
+            ogg = 'audio/ogg',
+            mp3 = 'audio/mpeg',
+            webm = 'video/webm',
+        }
+        return map[ext] or 'application/octet-stream'
+    end
+
+    local function safeStaticPath(path)
+        if type(path) ~= 'string' or path == '' then return nil end
+        if path:find('..', 1, true) or path:find('\\', 1, true) then return nil end
+        if path:sub(1, 5) == 'html/' or path:sub(1, 5) == 'apps/' or path:sub(1, 7) == 'sounds/' then
+            return path
+        end
+        return nil
+    end
+
+    RegisterNetEvent('v-phone:physical:pairRequest', function()
+        local src = source
+        if not src or src <= 0 or not GetPlayerName(src) then return end
+
+        local old = pairByPlayer[src]
+        if old then pairings[old] = nil end
+
+        local identity = identityOf(src)
+        local code = newPairCode()
+        pairings[code] = {
+            source = src,
+            identity = identity,
+            expires = os.time() + PAIR_TTL,
+        }
+        pairByPlayer[src] = code
+
+        local publicBase = reaperLinkPublicBase()
+        local pairUrl = publicBase ~= '' and (publicBase .. '/pair/' .. code) or ''
+        TriggerClientEvent('v-phone:physical:pairCode', src, code, PAIR_TTL, pairUrl, publicBase ~= '')
+        if publicBase == '' then
+            print('[ReaperLink] WARNING: reaperlink_public_url is not set. QR pairing cannot be generated.')
+        end
+        print(('[v-phone] physical pairing code %s created for %s (%d)'):format(
+            code, GetPlayerName(src) or 'player', src))
+    end)
+
+    RegisterNetEvent('v-phone:physical:nuiReply', function(requestId, result)
+        local src = source
+        local id = tostring(requestId or '')
+        local req = pending[id]
+        if not req or req.source ~= src then return end
+
+        local s = sessionForToken(req.token, false)
+        pending[id] = nil
+        if not s then
+            sendJson(req.response, 410, { error = 'session-ended' })
+            return
+        end
+        if result == nil then result = {} end
+        sendJson(req.response, 200, result)
+    end)
+
+    RegisterNetEvent('v-phone:physical:nuiMessage', function(message)
+        addMirrorEvent(source, message)
+    end)
+
+    AddEventHandler('playerDropped', function()
+        local src = source
+        local code = pairByPlayer[src]
+        if code then pairings[code] = nil end
+        pairByPlayer[src] = nil
+
+        local token = sessionByPlayer[src]
+        if token then endSession(token, false) end
+    end)
+
+    AddEventHandler('onResourceStop', function(resource)
+        if resource ~= RES then return end
+        for token in pairs(sessions) do endSession(token, false) end
+    end)
+
+    CreateThread(function()
+        while true do
+            Wait(30000)
+            local now, tick = os.time(), GetGameTimer()
+
+            for code, entry in pairs(pairings) do
+                if not entry or entry.expires <= now or not GetPlayerName(entry.source) then
+                    if entry and pairByPlayer[entry.source] == code then pairByPlayer[entry.source] = nil end
+                    pairings[code] = nil
+                end
+            end
+
+            for token, s in pairs(sessions) do
+                if not s or not GetPlayerName(s.source)
+                    or now - (s.lastSeen or s.created) > SESSION_IDLE_TTL
+                    or identityOf(s.source) ~= s.identity then
+                    endSession(token, s and GetPlayerName(s.source) ~= nil)
+                end
+            end
+
+            for key, set in pairs(chunks) do
+                if not set or set.expires <= tick then chunks[key] = nil end
+            end
+        end
+    end)
+
+    SetHttpHandler(function(req, res)
+        local path = tostring(req.path or '/')
+
+        if req.method ~= 'GET' then
+            send(res, 405, 'text/plain; charset=utf-8', 'GET only')
+            return
+        end
+
+        if path == '/' or path == '/physical' or path == '/physical/' then
+            local base = '/' .. RES .. '/physical'
+            sendHtml(res, ([[
+<h1>ReaperLink</h1>
+<p class="muted">In FiveM, type <b>/physicalpair</b>. Enter the six-digit code below.</p>
+<form id="pair"><input id="code" inputmode="numeric" maxlength="7" placeholder="PAIR CODE" autocomplete="one-time-code"><button type="submit">Pair this phone</button></form>
+<p id="status" class="muted"></p>
+<small>The code is one-time use and expires after ten minutes. The paired browser only reaches the same v-phone callbacks your character already has.</small>
+<script>
+document.getElementById('pair').addEventListener('submit',function(e){
+  e.preventDefault();
+  var c=document.getElementById('code').value.replace(/\D/g,'');
+  if(c) location.href=']] .. base .. [[/pair/'+c;
+});
+</script>]]))
+            return
+        end
+
+        local pairCode = path:match('^/physical/pair/(%d+)$')
+        if pairCode then
+            local entry = pairings[pairCode]
+            if not entry or entry.expires <= os.time() or not GetPlayerName(entry.source) then
+                sendHtml(res, '<h1>Pairing expired</h1><p class="bad">Run <b>/physicalpair</b> again in FiveM.</p>', 403)
+                return
+            end
+            if identityOf(entry.source) ~= entry.identity then
+                pairings[pairCode] = nil
+                if pairByPlayer[entry.source] == pairCode then pairByPlayer[entry.source] = nil end
+                sendHtml(res, '<h1>Character changed</h1><p class="bad">Generate a new pairing code.</p>', 403)
+                return
+            end
+
+            pairings[pairCode] = nil
+            if pairByPlayer[entry.source] == pairCode then pairByPlayer[entry.source] = nil end
+
+            local token = createSession(entry.source, entry.identity)
+            TriggerClientEvent('v-phone:physical:session', entry.source, true)
+
+            local location = ('/%s/physical/ui/%s'):format(RES, token)
+            send(res, 302, 'text/plain; charset=utf-8', 'Pairing accepted', {
+                ['Location'] = location,
+            })
+            return
+        end
+
+        local voiceJoinToken = path:match('^/physical/voice/join/([%w_-]+)$')
+        if voiceJoinToken then
+            local s = sessionForToken(voiceJoinToken)
+            if not s or not s.voiceCallId then
+                sendJson(res, 409, { error = 'no-active-call' })
+                return
+            end
+
+            if not s.voiceId then
+                local id
+                repeat id = randomVoiceId() until not voiceById[id]
+                s.voiceId = id
+                voiceById[id] = voiceJoinToken
+            end
+
+            local callKey = tostring(s.voiceCallId)
+            local room = voiceRooms[callKey]
+            if not room then room = {}; voiceRooms[callKey] = room end
+
+            local peers = {}
+            for peerId in pairs(room) do
+                if peerId ~= s.voiceId then peers[#peers + 1] = peerId end
+            end
+
+            if not room[s.voiceId] then
+                room[s.voiceId] = true
+                s.voiceJoined = true
+                for peerId in pairs(room) do
+                    if peerId ~= s.voiceId then
+                        local peerToken = voiceById[peerId]
+                        if peerToken then
+                            voicePush(peerToken, { type = 'peer-join', peer = s.voiceId })
+                        end
+                    end
+                end
+            end
+
+            local q = voiceQueue(voiceJoinToken)
+            sendJson(res, 200, {
+                ok = true,
+                voiceId = s.voiceId,
+                callId = s.voiceCallId,
+                peers = peers,
+                seq = q.seq,
+            })
+            return
+        end
+
+        local voiceLeaveToken = path:match('^/physical/voice/leave/([%w_-]+)$')
+        if voiceLeaveToken then
+            local s = sessionForToken(voiceLeaveToken, false)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            voiceLeave(voiceLeaveToken, true)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voicePollToken, voiceAfter =
+            path:match('^/physical/voice/events/([%w_-]+)/(%d+)$')
+        if voicePollToken then
+            local s = sessionForToken(voicePollToken)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            local q = voiceQueue(voicePollToken)
+            local after = tonumber(voiceAfter) or 0
+            local events = {}
+            for _, entry in ipairs(q.events) do
+                if entry.seq > after then events[#events + 1] = entry end
+            end
+            sendJson(res, 200, { ok = true, seq = q.seq, events = events })
+            return
+        end
+
+        local voiceChunkToken, voiceRequestId, voiceChunkIndex, voiceChunkTotal, voicePiece =
+            path:match('^/physical/voice/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if voiceChunkToken then
+            local s = sessionForToken(voiceChunkToken)
+            if not s or not s.voiceJoined then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+            local idx, total = tonumber(voiceChunkIndex), tonumber(voiceChunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #voicePiece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+            local key = 'voice:' .. voiceChunkToken .. ':' .. voiceRequestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = voicePiece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voiceSendToken, voiceSendRequest, voicePeer =
+            path:match('^/physical/voice/send/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if voiceSendToken then
+            local s = sessionForToken(voiceSendToken)
+            if not s or not s.voiceJoined or not s.voiceCallId or not s.voiceId then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+
+            local key = 'voice:' .. voiceSendToken .. ':' .. voiceSendRequest
+            local set = chunks[key]
+            if not set then sendJson(res, 400, { error = 'missing-chunks' }); return end
+            local parts = {}
+            for i = 1, set.total do
+                if not set.parts[i] then sendJson(res, 400, { error = 'missing-chunk' }); return end
+                parts[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local decoded = b64urlDecode(table.concat(parts))
+            local ok, payload = pcall(json.decode, decoded)
+            if not ok or type(payload) ~= 'table' then
+                sendJson(res, 400, { error = 'signal' })
+                return
+            end
+
+            local peerToken = voiceById[voicePeer]
+            local peerSession = peerToken and sessionForToken(peerToken, false) or nil
+            if not peerSession or not peerSession.voiceJoined
+                or tostring(peerSession.voiceCallId or '') ~= tostring(s.voiceCallId) then
+                sendJson(res, 404, { error = 'peer' })
+                return
+            end
+
+            voicePush(peerToken, { type = 'signal', peer = s.voiceId, data = payload })
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local uiToken = path:match('^/physical/ui/([%w_-]+)/*$')
+        if uiToken then
+            local s = sessionForToken(uiToken)
+            if not s then
+                sendHtml(res, '<h1>Session ended</h1><p class="bad">Run <b>/physicalpair</b> again.</p>', 403)
+                return
+            end
+
+            local index = LoadResourceFile(RES, 'html/index.html')
+            if not index then
+                sendHtml(res, '<h1>Missing UI</h1><p class="bad">html/index.html could not be read.</p>', 500)
+                return
+            end
+
+            local root = ('/%s/physical'):format(RES)
+            local base = ('/%s/physical/files/%s/html/'):format(RES, uiToken)
+            local injectHead = ('<base href="%s"><meta name="referrer" content="no-referrer">'):format(base)
+            index = index:gsub('<head>', '<head>' .. injectHead, 1)
+
+            local boot = ([[<script>
+window.__VPHONE_PHYSICAL__={token:"%s",base:"%s",resource:"%s"};
+</script><script src="physical.js"></script>
+<script src="reaperlink-voice.js"></script>
+<script src="sdk.js"></script>]]):format(uiToken, root, RES)
+
+            index = index:gsub('<script src="sdk%.js"></script>', boot, 1)
+            send(res, 200, 'text/html; charset=utf-8', index)
+            return
+        end
+
+        local staticToken, staticPath = path:match('^/physical/files/([%w_-]+)/(.+)$')
+        if staticToken and staticPath then
+            local s = sessionForToken(staticToken)
+            if not s then
+                send(res, 403, 'text/plain; charset=utf-8', 'Session ended')
+                return
+            end
+            staticPath = safeStaticPath(staticPath)
+            if not staticPath then
+                send(res, 400, 'text/plain; charset=utf-8', 'Bad path')
+                return
+            end
+            local data = LoadResourceFile(RES, staticPath)
+            if data == nil then
+                send(res, 404, 'text/plain; charset=utf-8', 'Not found')
+                return
+            end
+            send(res, 200, mimeFor(staticPath), data, {
+                ['Cache-Control'] = 'private, max-age=300',
+            })
+            return
+        end
+
+        local chunkToken, requestId, chunkIndex, chunkTotal, piece =
+            path:match('^/physical/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if chunkToken then
+            local s = sessionForToken(chunkToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+
+            local idx, total = tonumber(chunkIndex), tonumber(chunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #piece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+
+            local key = chunkToken .. ':' .. requestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = piece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local apiToken, requestId, callbackB64 =
+            path:match('^/physical/api/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if apiToken then
+            local s = sessionForToken(apiToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            if not allowRequest(apiToken) then
+                sendJson(res, 429, { error = 'rate' })
+                return
+            end
+            if pending[requestId] then
+                sendJson(res, 409, { error = 'duplicate' })
+                return
+            end
+
+            local key = apiToken .. ':' .. requestId
+            local set = chunks[key]
+            if not set then
+                sendJson(res, 400, { error = 'missing-body' })
+                return
+            end
+
+            local pieces = {}
+            for i = 1, set.total do
+                if not set.parts[i] then
+                    sendJson(res, 400, { error = 'missing-chunk', chunk = i })
+                    return
+                end
+                pieces[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local body = b64urlDecode(table.concat(pieces))
+            local callbackName = b64urlDecode(callbackB64)
+            if callbackName == '' or #callbackName > 96 then
+                sendJson(res, 400, { error = 'callback' })
+                return
+            end
+
+            local ok, data = pcall(json.decode, body ~= '' and body or '{}')
+            if not ok or type(data) ~= 'table' then data = {} end
+
+            pending[requestId] = {
+                source = s.source,
+                token = apiToken,
+                response = res,
+            }
+            TriggerClientEvent('v-phone:physical:invoke', s.source, requestId, callbackName, data)
+
+            SetTimeout(REQUEST_TTL_MS, function()
+                local waiting = pending[requestId]
+                if not waiting then return end
+                pending[requestId] = nil
+                sendJson(waiting.response, 504, { error = 'timeout', callback = callbackName })
+            end)
+            return
+        end
+
+        local eventToken, after = path:match('^/physical/events/([%w_-]+)/(%d+)$')
+        if eventToken then
+            local s = sessionForToken(eventToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            local last = tonumber(after) or 0
+            local out = {}
+            for _, entry in ipairs(s.events) do
+                if entry.seq > last then
+                    out[#out + 1] = entry
+                    if #out >= 64 then break end
+                end
+            end
+            sendJson(res, 200, {
+                ok = true,
+                seq = s.seq,
+                events = out,
+                player = GetPlayerName(s.source) or 'player',
+            })
+            return
+        end
+
+        local openToken = path:match('^/physical/open/([%w_-]+)$')
+        if openToken then
+            local s = sessionForToken(openToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            TriggerClientEvent('v-phone:physical:open', s.source)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local disconnectToken = path:match('^/physical/disconnect/([%w_-]+)$')
+        if disconnectToken then
+            local s = sessionForToken(disconnectToken, false)
+            if s then endSession(disconnectToken, true) end
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        send(res, 404, 'text/plain; charset=utf-8', 'Not found')
+    end)
+
+    print(('[v-phone] physical full bridge ready at /%s/physical'):format(RES))
+else
+    -- ══════════════════════════════════════════════════════════════
+    -- Physical phone bridge - client
+    -- ══════════════════════════════════════════════════════════════
+
+    -- This shared script loads BEFORE bridge/client/safety.lua. Capturing RegisterNUICallback
+    -- here means the later safety wrapper still does its normal exception/always-answer work,
+    -- while every final wrapped callback is also available to the paired physical browser.
+    local nativeRegisterNUICallback = RegisterNUICallback
+    local physicalCallbacks = {}
+    local physicalActive = false
+
+    function RegisterNUICallback(name, handler)
+        physicalCallbacks[tostring(name)] = handler
+        return nativeRegisterNUICallback(name, handler)
+    end
+
+    function PhysicalBridgeActive()
+        return physicalActive
+    end
+
+    function PhysicalInvokeNuiCallback(name, data, reply)
+        local handler = physicalCallbacks[tostring(name or '')]
+        if type(handler) ~= 'function' then
+            reply({ error = 'no-callback', callback = tostring(name or '') })
+            return
+        end
+
+        local answered = false
+        local function answer(result)
+            if answered then return end
+            answered = true
+            reply(result == nil and {} or result)
+        end
+
+        local ok, err = pcall(handler, type(data) == 'table' and data or {}, answer)
+        if not ok then
+            print(('[v-phone] physical callback %s raised: %s'):format(tostring(name), tostring(err)))
+            answer({ error = 'x' })
+        end
+    end
+
+    -- Mirror the same messages the stock client sends to CEF. When no real handset is paired,
+    -- the wrapper is one native call and a boolean check.
+    local nativeSendNUIMessage = SendNUIMessage
+    function SendNUIMessage(message)
+        local result = nativeSendNUIMessage(message)
+        if physicalActive and type(message) == 'table' then
+            TriggerServerEvent('v-phone:physical:nuiMessage', message)
+        end
+        return result
+    end
+
+    RegisterCommand('physicalpair', function()
+        TriggerServerEvent('v-phone:physical:pairRequest')
+    end, false)
+
+    RegisterNetEvent('v-phone:physical:pairCode', function(code, seconds, pairUrl, configured)
+        local msg = ('ReaperLink pairing code: %s (valid for %s seconds)'):format(
+            tostring(code), tostring(seconds or 600))
+        if type(pairUrl) == 'string' and pairUrl ~= '' then
+            msg = msg .. (' | %s'):format(pairUrl)
+        end
+        print(('[ReaperLink] %s'):format(msg))
+
+        if GetResourceState('chat') == 'started' then
+            TriggerEvent('chat:addMessage', {
+                color = { 200, 205, 212 },
+                multiline = true,
+                args = { 'ReaperLink', msg }
+            })
+        end
+
+        CreateThread(function()
+            ExecuteCommand('phone open')
+            Wait(180)
+            nativeSendNUIMessage({
+                action = 'reaperlink:pairing',
+                code = tostring(code),
+                seconds = tonumber(seconds) or 600,
+                url = type(pairUrl) == 'string' and pairUrl or '',
+                configured = configured == true,
+            })
+        end)
+    end)
+
+    RegisterNetEvent('v-phone:physical:session', function(active)
+        physicalActive = active == true
+        if not physicalActive then return end
+
+        -- Re-open once after pairing so the new browser receives a complete action=open payload
+        -- even when the in-game handset was already open before the session existed.
+        CreateThread(function()
+            ExecuteCommand('phone close')
+            Wait(150)
+            ExecuteCommand('phone open')
+        end)
+    end)
+
+    RegisterNetEvent('v-phone:physical:open', function()
+        ExecuteCommand('phone open')
+    end)
+
+    RegisterNetEvent('v-phone:physical:invoke', function(requestId, callbackName, data)
+        -- The server only emits this event for a validated live physical session. Do not gate
+        -- it on the local mirror flag: the first browser callback can arrive in the same few
+        -- milliseconds as the session-on event, and event ordering across the HTTP/client paths
+        -- should not turn the phone's boot request into a false "session" error.
+        if type(PhysicalInvokeNuiCallback) ~= 'function' then
+            TriggerServerEvent('v-phone:physical:nuiReply', requestId, { error = 'bridge' })
+            return
+        end
+
+        PhysicalInvokeNuiCallback(callbackName, data, function(result)
+            TriggerServerEvent('v-phone:physical:nuiReply', requestId, result)
+        end)
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- Original SDK example - still off by default
+-- ══════════════════════════════════════════════════════════════
+if not (Config and Config.SdkExample) then return end
+
+PhoneApp {
+    id       = 'example',
+    label    = 'Example',
+    icon     = 'note',
+    category = 'utilities',
+    desc     = 'The worked example: a folder dropped into apps/ and nothing else.',
+    developer = 'iFruit SDK',
+    version  = '2.0.0',
+    accent   = '#0A84FF',
+    permissions = { 'storage', 'contacts', 'photos', 'location', 'notifications' },
+    features = { 'Persistent data', 'Native pickers', 'Quick actions', 'Live lifecycle' },
+    keywords = { 'example', 'sdk', 'developer' },
+    optional = true,
+}
+, '')
         return base
+    end
+
+
+    local function reaperLinkVoiceBrowserConfig()
+        local stun = tostring(GetConvar('reaperlink_voice_stun', '') or ''):gsub('^%s+', ''):gsub('%s+
+    local function newPairCode()
+        for _ = 1, 60 do
+            local code = tostring(math.random(100000, 999999))
+            if not pairings[code] then return code end
+        end
+        return tostring(math.random(1000000, 9999999))
+    end
+
+    local function identityOf(src)
+        if Core and Core.GetPlayer then
+            local ok, p = pcall(Core.GetPlayer, src)
+            if ok and p then
+                local id = p.citizenid or p.identifier or p.charid or p.id
+                if id ~= nil and tostring(id) ~= '' then return tostring(id) end
+            end
+        end
+
+        for _, identifier in ipairs(GetPlayerIdentifiers(src) or {}) do
+            if identifier:sub(1, 8) == 'license:' then return identifier end
+        end
+        return ('source:%s'):format(tostring(src))
+    end
+
+    local function endSession(token, tellClient)
+        local s = sessions[token]
+        if not s then return end
+        voiceLeave(token, true)
+        sessions[token] = nil
+        rate[token] = nil
+
+        if sessionByPlayer[s.source] == token then
+            sessionByPlayer[s.source] = nil
+        end
+
+        for id, req in pairs(pending) do
+            if req.token == token then
+                sendJson(req.response, 410, { error = 'session-ended' })
+                pending[id] = nil
+            end
+        end
+
+        for key in pairs(chunks) do
+            if key:sub(1, #token + 1) == token .. ':' then chunks[key] = nil end
+        end
+
+        if tellClient and GetPlayerName(s.source) then
+            TriggerClientEvent('v-phone:physical:session', s.source, false)
+        end
+    end
+
+    local function sessionForToken(token, touch)
+        local s = sessions[token]
+        if not s then return nil, 'nosession' end
+        if not GetPlayerName(s.source) then
+            endSession(token, false)
+            return nil, 'offline'
+        end
+        if identityOf(s.source) ~= s.identity then
+            endSession(token, true)
+            return nil, 'character'
+        end
+        local now = os.time()
+        if now - (s.lastSeen or s.created) > SESSION_IDLE_TTL then
+            endSession(token, true)
+            return nil, 'expired'
+        end
+        if touch ~= false then s.lastSeen = now end
+        return s
+    end
+
+    local function createSession(src, identity)
+        local old = sessionByPlayer[src]
+        if old then endSession(old, true) end
+
+        local token
+        repeat token = randomToken() until not sessions[token]
+
+        local now = os.time()
+        sessions[token] = {
+            source = src,
+            identity = identity,
+            created = now,
+            lastSeen = now,
+            seq = 0,
+            events = {},
+        }
+        sessionByPlayer[src] = token
+        return token, sessions[token]
+    end
+
+    local function allowRequest(token)
+        local now = GetGameTimer()
+        local r = rate[token]
+        if not r or now - r.started >= 10000 then
+            rate[token] = { started = now, count = 1 }
+            return true
+        end
+        r.count = r.count + 1
+        return r.count <= 120
+    end
+
+    local function addMirrorEvent(src, message)
+        local token = sessionByPlayer[src]
+        if not token then return end
+        local s = sessionForToken(token, false)
+        if not s or type(message) ~= 'table' then return end
+
+        -- The paired FiveM client is authoritative for which call this browser may join.
+        -- A browser never supplies an arbitrary call id.
+        if message.action == 'call' then
+            local nextCall = type(message.call) == 'table' and message.call or nil
+            local nextId = nextCall and nextCall.state == 'active' and tonumber(nextCall.id) or nil
+            if s.voiceCallId ~= nextId then
+                if s.voiceJoined then voiceLeave(token, true) end
+                s.voiceCallId = nextId
+            end
+        end
+
+        s.seq = s.seq + 1
+        s.events[#s.events + 1] = { seq = s.seq, message = message }
+        if #s.events > MAX_EVENT_QUEUE then table.remove(s.events, 1) end
+    end
+
+    local function mimeFor(path)
+        local ext = path:match('%.([%w]+)$')
+        ext = ext and ext:lower() or ''
+        local map = {
+            html = 'text/html; charset=utf-8',
+            css = 'text/css; charset=utf-8',
+            js = 'application/javascript; charset=utf-8',
+            json = 'application/json; charset=utf-8',
+            svg = 'image/svg+xml',
+            png = 'image/png',
+            jpg = 'image/jpeg',
+            jpeg = 'image/jpeg',
+            webp = 'image/webp',
+            gif = 'image/gif',
+            wav = 'audio/wav',
+            ogg = 'audio/ogg',
+            mp3 = 'audio/mpeg',
+            webm = 'video/webm',
+        }
+        return map[ext] or 'application/octet-stream'
+    end
+
+    local function safeStaticPath(path)
+        if type(path) ~= 'string' or path == '' then return nil end
+        if path:find('..', 1, true) or path:find('\\', 1, true) then return nil end
+        if path:sub(1, 5) == 'html/' or path:sub(1, 5) == 'apps/' or path:sub(1, 7) == 'sounds/' then
+            return path
+        end
+        return nil
+    end
+
+    RegisterNetEvent('v-phone:physical:pairRequest', function()
+        local src = source
+        if not src or src <= 0 or not GetPlayerName(src) then return end
+
+        local old = pairByPlayer[src]
+        if old then pairings[old] = nil end
+
+        local identity = identityOf(src)
+        local code = newPairCode()
+        pairings[code] = {
+            source = src,
+            identity = identity,
+            expires = os.time() + PAIR_TTL,
+        }
+        pairByPlayer[src] = code
+
+        local publicBase = reaperLinkPublicBase()
+        local pairUrl = publicBase ~= '' and (publicBase .. '/pair/' .. code) or ''
+        TriggerClientEvent('v-phone:physical:pairCode', src, code, PAIR_TTL, pairUrl, publicBase ~= '')
+        if publicBase == '' then
+            print('[ReaperLink] WARNING: reaperlink_public_url is not set. QR pairing cannot be generated.')
+        end
+        print(('[v-phone] physical pairing code %s created for %s (%d)'):format(
+            code, GetPlayerName(src) or 'player', src))
+    end)
+
+    RegisterNetEvent('v-phone:physical:nuiReply', function(requestId, result)
+        local src = source
+        local id = tostring(requestId or '')
+        local req = pending[id]
+        if not req or req.source ~= src then return end
+
+        local s = sessionForToken(req.token, false)
+        pending[id] = nil
+        if not s then
+            sendJson(req.response, 410, { error = 'session-ended' })
+            return
+        end
+        if result == nil then result = {} end
+        sendJson(req.response, 200, result)
+    end)
+
+    RegisterNetEvent('v-phone:physical:nuiMessage', function(message)
+        addMirrorEvent(source, message)
+    end)
+
+    AddEventHandler('playerDropped', function()
+        local src = source
+        local code = pairByPlayer[src]
+        if code then pairings[code] = nil end
+        pairByPlayer[src] = nil
+
+        local token = sessionByPlayer[src]
+        if token then endSession(token, false) end
+    end)
+
+    AddEventHandler('onResourceStop', function(resource)
+        if resource ~= RES then return end
+        for token in pairs(sessions) do endSession(token, false) end
+    end)
+
+    CreateThread(function()
+        while true do
+            Wait(30000)
+            local now, tick = os.time(), GetGameTimer()
+
+            for code, entry in pairs(pairings) do
+                if not entry or entry.expires <= now or not GetPlayerName(entry.source) then
+                    if entry and pairByPlayer[entry.source] == code then pairByPlayer[entry.source] = nil end
+                    pairings[code] = nil
+                end
+            end
+
+            for token, s in pairs(sessions) do
+                if not s or not GetPlayerName(s.source)
+                    or now - (s.lastSeen or s.created) > SESSION_IDLE_TTL
+                    or identityOf(s.source) ~= s.identity then
+                    endSession(token, s and GetPlayerName(s.source) ~= nil)
+                end
+            end
+
+            for key, set in pairs(chunks) do
+                if not set or set.expires <= tick then chunks[key] = nil end
+            end
+        end
+    end)
+
+    SetHttpHandler(function(req, res)
+        local path = tostring(req.path or '/')
+
+        if req.method ~= 'GET' then
+            send(res, 405, 'text/plain; charset=utf-8', 'GET only')
+            return
+        end
+
+        if path == '/' or path == '/physical' or path == '/physical/' then
+            local base = '/' .. RES .. '/physical'
+            sendHtml(res, ([[
+<h1>ReaperLink</h1>
+<p class="muted">In FiveM, type <b>/physicalpair</b>. Enter the six-digit code below.</p>
+<form id="pair"><input id="code" inputmode="numeric" maxlength="7" placeholder="PAIR CODE" autocomplete="one-time-code"><button type="submit">Pair this phone</button></form>
+<p id="status" class="muted"></p>
+<small>The code is one-time use and expires after ten minutes. The paired browser only reaches the same v-phone callbacks your character already has.</small>
+<script>
+document.getElementById('pair').addEventListener('submit',function(e){
+  e.preventDefault();
+  var c=document.getElementById('code').value.replace(/\D/g,'');
+  if(c) location.href=']] .. base .. [[/pair/'+c;
+});
+</script>]]))
+            return
+        end
+
+        local pairCode = path:match('^/physical/pair/(%d+)$')
+        if pairCode then
+            local entry = pairings[pairCode]
+            if not entry or entry.expires <= os.time() or not GetPlayerName(entry.source) then
+                sendHtml(res, '<h1>Pairing expired</h1><p class="bad">Run <b>/physicalpair</b> again in FiveM.</p>', 403)
+                return
+            end
+            if identityOf(entry.source) ~= entry.identity then
+                pairings[pairCode] = nil
+                if pairByPlayer[entry.source] == pairCode then pairByPlayer[entry.source] = nil end
+                sendHtml(res, '<h1>Character changed</h1><p class="bad">Generate a new pairing code.</p>', 403)
+                return
+            end
+
+            pairings[pairCode] = nil
+            if pairByPlayer[entry.source] == pairCode then pairByPlayer[entry.source] = nil end
+
+            local token = createSession(entry.source, entry.identity)
+            TriggerClientEvent('v-phone:physical:session', entry.source, true)
+
+            local location = ('/%s/physical/ui/%s'):format(RES, token)
+            send(res, 302, 'text/plain; charset=utf-8', 'Pairing accepted', {
+                ['Location'] = location,
+            })
+            return
+        end
+
+        local voiceJoinToken = path:match('^/physical/voice/join/([%w_-]+)$')
+        if voiceJoinToken then
+            local s = sessionForToken(voiceJoinToken)
+            if not s or not s.voiceCallId then
+                sendJson(res, 409, { error = 'no-active-call' })
+                return
+            end
+
+            if not s.voiceId then
+                local id
+                repeat id = randomVoiceId() until not voiceById[id]
+                s.voiceId = id
+                voiceById[id] = voiceJoinToken
+            end
+
+            local callKey = tostring(s.voiceCallId)
+            local room = voiceRooms[callKey]
+            if not room then room = {}; voiceRooms[callKey] = room end
+
+            local peers = {}
+            for peerId in pairs(room) do
+                if peerId ~= s.voiceId then peers[#peers + 1] = peerId end
+            end
+
+            if not room[s.voiceId] then
+                room[s.voiceId] = true
+                s.voiceJoined = true
+                for peerId in pairs(room) do
+                    if peerId ~= s.voiceId then
+                        local peerToken = voiceById[peerId]
+                        if peerToken then
+                            voicePush(peerToken, { type = 'peer-join', peer = s.voiceId })
+                        end
+                    end
+                end
+            end
+
+            local q = voiceQueue(voiceJoinToken)
+            sendJson(res, 200, {
+                ok = true,
+                voiceId = s.voiceId,
+                callId = s.voiceCallId,
+                peers = peers,
+                seq = q.seq,
+            })
+            return
+        end
+
+        local voiceLeaveToken = path:match('^/physical/voice/leave/([%w_-]+)$')
+        if voiceLeaveToken then
+            local s = sessionForToken(voiceLeaveToken, false)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            voiceLeave(voiceLeaveToken, true)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voicePollToken, voiceAfter =
+            path:match('^/physical/voice/events/([%w_-]+)/(%d+)$')
+        if voicePollToken then
+            local s = sessionForToken(voicePollToken)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            local q = voiceQueue(voicePollToken)
+            local after = tonumber(voiceAfter) or 0
+            local events = {}
+            for _, entry in ipairs(q.events) do
+                if entry.seq > after then events[#events + 1] = entry end
+            end
+            sendJson(res, 200, { ok = true, seq = q.seq, events = events })
+            return
+        end
+
+        local voiceChunkToken, voiceRequestId, voiceChunkIndex, voiceChunkTotal, voicePiece =
+            path:match('^/physical/voice/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if voiceChunkToken then
+            local s = sessionForToken(voiceChunkToken)
+            if not s or not s.voiceJoined then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+            local idx, total = tonumber(voiceChunkIndex), tonumber(voiceChunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #voicePiece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+            local key = 'voice:' .. voiceChunkToken .. ':' .. voiceRequestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = voicePiece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voiceSendToken, voiceSendRequest, voicePeer =
+            path:match('^/physical/voice/send/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if voiceSendToken then
+            local s = sessionForToken(voiceSendToken)
+            if not s or not s.voiceJoined or not s.voiceCallId or not s.voiceId then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+
+            local key = 'voice:' .. voiceSendToken .. ':' .. voiceSendRequest
+            local set = chunks[key]
+            if not set then sendJson(res, 400, { error = 'missing-chunks' }); return end
+            local parts = {}
+            for i = 1, set.total do
+                if not set.parts[i] then sendJson(res, 400, { error = 'missing-chunk' }); return end
+                parts[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local decoded = b64urlDecode(table.concat(parts))
+            local ok, payload = pcall(json.decode, decoded)
+            if not ok or type(payload) ~= 'table' then
+                sendJson(res, 400, { error = 'signal' })
+                return
+            end
+
+            local peerToken = voiceById[voicePeer]
+            local peerSession = peerToken and sessionForToken(peerToken, false) or nil
+            if not peerSession or not peerSession.voiceJoined
+                or tostring(peerSession.voiceCallId or '') ~= tostring(s.voiceCallId) then
+                sendJson(res, 404, { error = 'peer' })
+                return
+            end
+
+            voicePush(peerToken, { type = 'signal', peer = s.voiceId, data = payload })
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local uiToken = path:match('^/physical/ui/([%w_-]+)/*$')
+        if uiToken then
+            local s = sessionForToken(uiToken)
+            if not s then
+                sendHtml(res, '<h1>Session ended</h1><p class="bad">Run <b>/physicalpair</b> again.</p>', 403)
+                return
+            end
+
+            local index = LoadResourceFile(RES, 'html/index.html')
+            if not index then
+                sendHtml(res, '<h1>Missing UI</h1><p class="bad">html/index.html could not be read.</p>', 500)
+                return
+            end
+
+            local root = ('/%s/physical'):format(RES)
+            local base = ('/%s/physical/files/%s/html/'):format(RES, uiToken)
+            local injectHead = ('<base href="%s"><meta name="referrer" content="no-referrer">'):format(base)
+            index = index:gsub('<head>', '<head>' .. injectHead, 1)
+
+            local boot = ([[<script>
+window.__VPHONE_PHYSICAL__={token:"%s",base:"%s",resource:"%s"};
+</script><script src="physical.js"></script>
+<script src="reaperlink-voice.js"></script>
+<script src="sdk.js"></script>]]):format(uiToken, root, RES)
+
+            index = index:gsub('<script src="sdk%.js"></script>', boot, 1)
+            send(res, 200, 'text/html; charset=utf-8', index)
+            return
+        end
+
+        local staticToken, staticPath = path:match('^/physical/files/([%w_-]+)/(.+)$')
+        if staticToken and staticPath then
+            local s = sessionForToken(staticToken)
+            if not s then
+                send(res, 403, 'text/plain; charset=utf-8', 'Session ended')
+                return
+            end
+            staticPath = safeStaticPath(staticPath)
+            if not staticPath then
+                send(res, 400, 'text/plain; charset=utf-8', 'Bad path')
+                return
+            end
+            local data = LoadResourceFile(RES, staticPath)
+            if data == nil then
+                send(res, 404, 'text/plain; charset=utf-8', 'Not found')
+                return
+            end
+            send(res, 200, mimeFor(staticPath), data, {
+                ['Cache-Control'] = 'private, max-age=300',
+            })
+            return
+        end
+
+        local chunkToken, requestId, chunkIndex, chunkTotal, piece =
+            path:match('^/physical/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if chunkToken then
+            local s = sessionForToken(chunkToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+
+            local idx, total = tonumber(chunkIndex), tonumber(chunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #piece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+
+            local key = chunkToken .. ':' .. requestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = piece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local apiToken, requestId, callbackB64 =
+            path:match('^/physical/api/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if apiToken then
+            local s = sessionForToken(apiToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            if not allowRequest(apiToken) then
+                sendJson(res, 429, { error = 'rate' })
+                return
+            end
+            if pending[requestId] then
+                sendJson(res, 409, { error = 'duplicate' })
+                return
+            end
+
+            local key = apiToken .. ':' .. requestId
+            local set = chunks[key]
+            if not set then
+                sendJson(res, 400, { error = 'missing-body' })
+                return
+            end
+
+            local pieces = {}
+            for i = 1, set.total do
+                if not set.parts[i] then
+                    sendJson(res, 400, { error = 'missing-chunk', chunk = i })
+                    return
+                end
+                pieces[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local body = b64urlDecode(table.concat(pieces))
+            local callbackName = b64urlDecode(callbackB64)
+            if callbackName == '' or #callbackName > 96 then
+                sendJson(res, 400, { error = 'callback' })
+                return
+            end
+
+            local ok, data = pcall(json.decode, body ~= '' and body or '{}')
+            if not ok or type(data) ~= 'table' then data = {} end
+
+            pending[requestId] = {
+                source = s.source,
+                token = apiToken,
+                response = res,
+            }
+            TriggerClientEvent('v-phone:physical:invoke', s.source, requestId, callbackName, data)
+
+            SetTimeout(REQUEST_TTL_MS, function()
+                local waiting = pending[requestId]
+                if not waiting then return end
+                pending[requestId] = nil
+                sendJson(waiting.response, 504, { error = 'timeout', callback = callbackName })
+            end)
+            return
+        end
+
+        local eventToken, after = path:match('^/physical/events/([%w_-]+)/(%d+)$')
+        if eventToken then
+            local s = sessionForToken(eventToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            local last = tonumber(after) or 0
+            local out = {}
+            for _, entry in ipairs(s.events) do
+                if entry.seq > last then
+                    out[#out + 1] = entry
+                    if #out >= 64 then break end
+                end
+            end
+            sendJson(res, 200, {
+                ok = true,
+                seq = s.seq,
+                events = out,
+                player = GetPlayerName(s.source) or 'player',
+            })
+            return
+        end
+
+        local openToken = path:match('^/physical/open/([%w_-]+)$')
+        if openToken then
+            local s = sessionForToken(openToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            TriggerClientEvent('v-phone:physical:open', s.source)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local disconnectToken = path:match('^/physical/disconnect/([%w_-]+)$')
+        if disconnectToken then
+            local s = sessionForToken(disconnectToken, false)
+            if s then endSession(disconnectToken, true) end
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        send(res, 404, 'text/plain; charset=utf-8', 'Not found')
+    end)
+
+    print(('[v-phone] physical full bridge ready at /%s/physical'):format(RES))
+else
+    -- ══════════════════════════════════════════════════════════════
+    -- Physical phone bridge - client
+    -- ══════════════════════════════════════════════════════════════
+
+    -- This shared script loads BEFORE bridge/client/safety.lua. Capturing RegisterNUICallback
+    -- here means the later safety wrapper still does its normal exception/always-answer work,
+    -- while every final wrapped callback is also available to the paired physical browser.
+    local nativeRegisterNUICallback = RegisterNUICallback
+    local physicalCallbacks = {}
+    local physicalActive = false
+
+    function RegisterNUICallback(name, handler)
+        physicalCallbacks[tostring(name)] = handler
+        return nativeRegisterNUICallback(name, handler)
+    end
+
+    function PhysicalBridgeActive()
+        return physicalActive
+    end
+
+    function PhysicalInvokeNuiCallback(name, data, reply)
+        local handler = physicalCallbacks[tostring(name or '')]
+        if type(handler) ~= 'function' then
+            reply({ error = 'no-callback', callback = tostring(name or '') })
+            return
+        end
+
+        local answered = false
+        local function answer(result)
+            if answered then return end
+            answered = true
+            reply(result == nil and {} or result)
+        end
+
+        local ok, err = pcall(handler, type(data) == 'table' and data or {}, answer)
+        if not ok then
+            print(('[v-phone] physical callback %s raised: %s'):format(tostring(name), tostring(err)))
+            answer({ error = 'x' })
+        end
+    end
+
+    -- Mirror the same messages the stock client sends to CEF. When no real handset is paired,
+    -- the wrapper is one native call and a boolean check.
+    local nativeSendNUIMessage = SendNUIMessage
+    function SendNUIMessage(message)
+        local result = nativeSendNUIMessage(message)
+        if physicalActive and type(message) == 'table' then
+            TriggerServerEvent('v-phone:physical:nuiMessage', message)
+        end
+        return result
+    end
+
+    RegisterCommand('physicalpair', function()
+        TriggerServerEvent('v-phone:physical:pairRequest')
+    end, false)
+
+    RegisterNetEvent('v-phone:physical:pairCode', function(code, seconds, pairUrl, configured)
+        local msg = ('ReaperLink pairing code: %s (valid for %s seconds)'):format(
+            tostring(code), tostring(seconds or 600))
+        if type(pairUrl) == 'string' and pairUrl ~= '' then
+            msg = msg .. (' | %s'):format(pairUrl)
+        end
+        print(('[ReaperLink] %s'):format(msg))
+
+        if GetResourceState('chat') == 'started' then
+            TriggerEvent('chat:addMessage', {
+                color = { 200, 205, 212 },
+                multiline = true,
+                args = { 'ReaperLink', msg }
+            })
+        end
+
+        CreateThread(function()
+            ExecuteCommand('phone open')
+            Wait(180)
+            nativeSendNUIMessage({
+                action = 'reaperlink:pairing',
+                code = tostring(code),
+                seconds = tonumber(seconds) or 600,
+                url = type(pairUrl) == 'string' and pairUrl or '',
+                configured = configured == true,
+            })
+        end)
+    end)
+
+    RegisterNetEvent('v-phone:physical:session', function(active)
+        physicalActive = active == true
+        if not physicalActive then return end
+
+        -- Re-open once after pairing so the new browser receives a complete action=open payload
+        -- even when the in-game handset was already open before the session existed.
+        CreateThread(function()
+            ExecuteCommand('phone close')
+            Wait(150)
+            ExecuteCommand('phone open')
+        end)
+    end)
+
+    RegisterNetEvent('v-phone:physical:open', function()
+        ExecuteCommand('phone open')
+    end)
+
+    RegisterNetEvent('v-phone:physical:invoke', function(requestId, callbackName, data)
+        -- The server only emits this event for a validated live physical session. Do not gate
+        -- it on the local mirror flag: the first browser callback can arrive in the same few
+        -- milliseconds as the session-on event, and event ordering across the HTTP/client paths
+        -- should not turn the phone's boot request into a false "session" error.
+        if type(PhysicalInvokeNuiCallback) ~= 'function' then
+            TriggerServerEvent('v-phone:physical:nuiReply', requestId, { error = 'bridge' })
+            return
+        end
+
+        PhysicalInvokeNuiCallback(callbackName, data, function(result)
+            TriggerServerEvent('v-phone:physical:nuiReply', requestId, result)
+        end)
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- Original SDK example - still off by default
+-- ══════════════════════════════════════════════════════════════
+if not (Config and Config.SdkExample) then return end
+
+PhoneApp {
+    id       = 'example',
+    label    = 'Example',
+    icon     = 'note',
+    category = 'utilities',
+    desc     = 'The worked example: a folder dropped into apps/ and nothing else.',
+    developer = 'iFruit SDK',
+    version  = '2.0.0',
+    accent   = '#0A84FF',
+    permissions = { 'storage', 'contacts', 'photos', 'location', 'notifications' },
+    features = { 'Persistent data', 'Native pickers', 'Quick actions', 'Live lifecycle' },
+    keywords = { 'example', 'sdk', 'developer' },
+    optional = true,
+}
+, '')
+        local turnUrl = tostring(GetConvar('reaperlink_voice_turn_url', '') or ''):gsub('^%s+', ''):gsub('%s+
+    local function newPairCode()
+        for _ = 1, 60 do
+            local code = tostring(math.random(100000, 999999))
+            if not pairings[code] then return code end
+        end
+        return tostring(math.random(1000000, 9999999))
+    end
+
+    local function identityOf(src)
+        if Core and Core.GetPlayer then
+            local ok, p = pcall(Core.GetPlayer, src)
+            if ok and p then
+                local id = p.citizenid or p.identifier or p.charid or p.id
+                if id ~= nil and tostring(id) ~= '' then return tostring(id) end
+            end
+        end
+
+        for _, identifier in ipairs(GetPlayerIdentifiers(src) or {}) do
+            if identifier:sub(1, 8) == 'license:' then return identifier end
+        end
+        return ('source:%s'):format(tostring(src))
+    end
+
+    local function endSession(token, tellClient)
+        local s = sessions[token]
+        if not s then return end
+        voiceLeave(token, true)
+        sessions[token] = nil
+        rate[token] = nil
+
+        if sessionByPlayer[s.source] == token then
+            sessionByPlayer[s.source] = nil
+        end
+
+        for id, req in pairs(pending) do
+            if req.token == token then
+                sendJson(req.response, 410, { error = 'session-ended' })
+                pending[id] = nil
+            end
+        end
+
+        for key in pairs(chunks) do
+            if key:sub(1, #token + 1) == token .. ':' then chunks[key] = nil end
+        end
+
+        if tellClient and GetPlayerName(s.source) then
+            TriggerClientEvent('v-phone:physical:session', s.source, false)
+        end
+    end
+
+    local function sessionForToken(token, touch)
+        local s = sessions[token]
+        if not s then return nil, 'nosession' end
+        if not GetPlayerName(s.source) then
+            endSession(token, false)
+            return nil, 'offline'
+        end
+        if identityOf(s.source) ~= s.identity then
+            endSession(token, true)
+            return nil, 'character'
+        end
+        local now = os.time()
+        if now - (s.lastSeen or s.created) > SESSION_IDLE_TTL then
+            endSession(token, true)
+            return nil, 'expired'
+        end
+        if touch ~= false then s.lastSeen = now end
+        return s
+    end
+
+    local function createSession(src, identity)
+        local old = sessionByPlayer[src]
+        if old then endSession(old, true) end
+
+        local token
+        repeat token = randomToken() until not sessions[token]
+
+        local now = os.time()
+        sessions[token] = {
+            source = src,
+            identity = identity,
+            created = now,
+            lastSeen = now,
+            seq = 0,
+            events = {},
+        }
+        sessionByPlayer[src] = token
+        return token, sessions[token]
+    end
+
+    local function allowRequest(token)
+        local now = GetGameTimer()
+        local r = rate[token]
+        if not r or now - r.started >= 10000 then
+            rate[token] = { started = now, count = 1 }
+            return true
+        end
+        r.count = r.count + 1
+        return r.count <= 120
+    end
+
+    local function addMirrorEvent(src, message)
+        local token = sessionByPlayer[src]
+        if not token then return end
+        local s = sessionForToken(token, false)
+        if not s or type(message) ~= 'table' then return end
+
+        -- The paired FiveM client is authoritative for which call this browser may join.
+        -- A browser never supplies an arbitrary call id.
+        if message.action == 'call' then
+            local nextCall = type(message.call) == 'table' and message.call or nil
+            local nextId = nextCall and nextCall.state == 'active' and tonumber(nextCall.id) or nil
+            if s.voiceCallId ~= nextId then
+                if s.voiceJoined then voiceLeave(token, true) end
+                s.voiceCallId = nextId
+            end
+        end
+
+        s.seq = s.seq + 1
+        s.events[#s.events + 1] = { seq = s.seq, message = message }
+        if #s.events > MAX_EVENT_QUEUE then table.remove(s.events, 1) end
+    end
+
+    local function mimeFor(path)
+        local ext = path:match('%.([%w]+)$')
+        ext = ext and ext:lower() or ''
+        local map = {
+            html = 'text/html; charset=utf-8',
+            css = 'text/css; charset=utf-8',
+            js = 'application/javascript; charset=utf-8',
+            json = 'application/json; charset=utf-8',
+            svg = 'image/svg+xml',
+            png = 'image/png',
+            jpg = 'image/jpeg',
+            jpeg = 'image/jpeg',
+            webp = 'image/webp',
+            gif = 'image/gif',
+            wav = 'audio/wav',
+            ogg = 'audio/ogg',
+            mp3 = 'audio/mpeg',
+            webm = 'video/webm',
+        }
+        return map[ext] or 'application/octet-stream'
+    end
+
+    local function safeStaticPath(path)
+        if type(path) ~= 'string' or path == '' then return nil end
+        if path:find('..', 1, true) or path:find('\\', 1, true) then return nil end
+        if path:sub(1, 5) == 'html/' or path:sub(1, 5) == 'apps/' or path:sub(1, 7) == 'sounds/' then
+            return path
+        end
+        return nil
+    end
+
+    RegisterNetEvent('v-phone:physical:pairRequest', function()
+        local src = source
+        if not src or src <= 0 or not GetPlayerName(src) then return end
+
+        local old = pairByPlayer[src]
+        if old then pairings[old] = nil end
+
+        local identity = identityOf(src)
+        local code = newPairCode()
+        pairings[code] = {
+            source = src,
+            identity = identity,
+            expires = os.time() + PAIR_TTL,
+        }
+        pairByPlayer[src] = code
+
+        local publicBase = reaperLinkPublicBase()
+        local pairUrl = publicBase ~= '' and (publicBase .. '/pair/' .. code) or ''
+        TriggerClientEvent('v-phone:physical:pairCode', src, code, PAIR_TTL, pairUrl, publicBase ~= '')
+        if publicBase == '' then
+            print('[ReaperLink] WARNING: reaperlink_public_url is not set. QR pairing cannot be generated.')
+        end
+        print(('[v-phone] physical pairing code %s created for %s (%d)'):format(
+            code, GetPlayerName(src) or 'player', src))
+    end)
+
+    RegisterNetEvent('v-phone:physical:nuiReply', function(requestId, result)
+        local src = source
+        local id = tostring(requestId or '')
+        local req = pending[id]
+        if not req or req.source ~= src then return end
+
+        local s = sessionForToken(req.token, false)
+        pending[id] = nil
+        if not s then
+            sendJson(req.response, 410, { error = 'session-ended' })
+            return
+        end
+        if result == nil then result = {} end
+        sendJson(req.response, 200, result)
+    end)
+
+    RegisterNetEvent('v-phone:physical:nuiMessage', function(message)
+        addMirrorEvent(source, message)
+    end)
+
+    AddEventHandler('playerDropped', function()
+        local src = source
+        local code = pairByPlayer[src]
+        if code then pairings[code] = nil end
+        pairByPlayer[src] = nil
+
+        local token = sessionByPlayer[src]
+        if token then endSession(token, false) end
+    end)
+
+    AddEventHandler('onResourceStop', function(resource)
+        if resource ~= RES then return end
+        for token in pairs(sessions) do endSession(token, false) end
+    end)
+
+    CreateThread(function()
+        while true do
+            Wait(30000)
+            local now, tick = os.time(), GetGameTimer()
+
+            for code, entry in pairs(pairings) do
+                if not entry or entry.expires <= now or not GetPlayerName(entry.source) then
+                    if entry and pairByPlayer[entry.source] == code then pairByPlayer[entry.source] = nil end
+                    pairings[code] = nil
+                end
+            end
+
+            for token, s in pairs(sessions) do
+                if not s or not GetPlayerName(s.source)
+                    or now - (s.lastSeen or s.created) > SESSION_IDLE_TTL
+                    or identityOf(s.source) ~= s.identity then
+                    endSession(token, s and GetPlayerName(s.source) ~= nil)
+                end
+            end
+
+            for key, set in pairs(chunks) do
+                if not set or set.expires <= tick then chunks[key] = nil end
+            end
+        end
+    end)
+
+    SetHttpHandler(function(req, res)
+        local path = tostring(req.path or '/')
+
+        if req.method ~= 'GET' then
+            send(res, 405, 'text/plain; charset=utf-8', 'GET only')
+            return
+        end
+
+        if path == '/' or path == '/physical' or path == '/physical/' then
+            local base = '/' .. RES .. '/physical'
+            sendHtml(res, ([[
+<h1>ReaperLink</h1>
+<p class="muted">In FiveM, type <b>/physicalpair</b>. Enter the six-digit code below.</p>
+<form id="pair"><input id="code" inputmode="numeric" maxlength="7" placeholder="PAIR CODE" autocomplete="one-time-code"><button type="submit">Pair this phone</button></form>
+<p id="status" class="muted"></p>
+<small>The code is one-time use and expires after ten minutes. The paired browser only reaches the same v-phone callbacks your character already has.</small>
+<script>
+document.getElementById('pair').addEventListener('submit',function(e){
+  e.preventDefault();
+  var c=document.getElementById('code').value.replace(/\D/g,'');
+  if(c) location.href=']] .. base .. [[/pair/'+c;
+});
+</script>]]))
+            return
+        end
+
+        local pairCode = path:match('^/physical/pair/(%d+)$')
+        if pairCode then
+            local entry = pairings[pairCode]
+            if not entry or entry.expires <= os.time() or not GetPlayerName(entry.source) then
+                sendHtml(res, '<h1>Pairing expired</h1><p class="bad">Run <b>/physicalpair</b> again in FiveM.</p>', 403)
+                return
+            end
+            if identityOf(entry.source) ~= entry.identity then
+                pairings[pairCode] = nil
+                if pairByPlayer[entry.source] == pairCode then pairByPlayer[entry.source] = nil end
+                sendHtml(res, '<h1>Character changed</h1><p class="bad">Generate a new pairing code.</p>', 403)
+                return
+            end
+
+            pairings[pairCode] = nil
+            if pairByPlayer[entry.source] == pairCode then pairByPlayer[entry.source] = nil end
+
+            local token = createSession(entry.source, entry.identity)
+            TriggerClientEvent('v-phone:physical:session', entry.source, true)
+
+            local location = ('/%s/physical/ui/%s'):format(RES, token)
+            send(res, 302, 'text/plain; charset=utf-8', 'Pairing accepted', {
+                ['Location'] = location,
+            })
+            return
+        end
+
+        local voiceJoinToken = path:match('^/physical/voice/join/([%w_-]+)$')
+        if voiceJoinToken then
+            local s = sessionForToken(voiceJoinToken)
+            if not s or not s.voiceCallId then
+                sendJson(res, 409, { error = 'no-active-call' })
+                return
+            end
+
+            if not s.voiceId then
+                local id
+                repeat id = randomVoiceId() until not voiceById[id]
+                s.voiceId = id
+                voiceById[id] = voiceJoinToken
+            end
+
+            local callKey = tostring(s.voiceCallId)
+            local room = voiceRooms[callKey]
+            if not room then room = {}; voiceRooms[callKey] = room end
+
+            local peers = {}
+            for peerId in pairs(room) do
+                if peerId ~= s.voiceId then peers[#peers + 1] = peerId end
+            end
+
+            if not room[s.voiceId] then
+                room[s.voiceId] = true
+                s.voiceJoined = true
+                for peerId in pairs(room) do
+                    if peerId ~= s.voiceId then
+                        local peerToken = voiceById[peerId]
+                        if peerToken then
+                            voicePush(peerToken, { type = 'peer-join', peer = s.voiceId })
+                        end
+                    end
+                end
+            end
+
+            local q = voiceQueue(voiceJoinToken)
+            sendJson(res, 200, {
+                ok = true,
+                voiceId = s.voiceId,
+                callId = s.voiceCallId,
+                peers = peers,
+                seq = q.seq,
+            })
+            return
+        end
+
+        local voiceLeaveToken = path:match('^/physical/voice/leave/([%w_-]+)$')
+        if voiceLeaveToken then
+            local s = sessionForToken(voiceLeaveToken, false)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            voiceLeave(voiceLeaveToken, true)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voicePollToken, voiceAfter =
+            path:match('^/physical/voice/events/([%w_-]+)/(%d+)$')
+        if voicePollToken then
+            local s = sessionForToken(voicePollToken)
+            if not s then sendJson(res, 403, { error = 'session' }); return end
+            local q = voiceQueue(voicePollToken)
+            local after = tonumber(voiceAfter) or 0
+            local events = {}
+            for _, entry in ipairs(q.events) do
+                if entry.seq > after then events[#events + 1] = entry end
+            end
+            sendJson(res, 200, { ok = true, seq = q.seq, events = events })
+            return
+        end
+
+        local voiceChunkToken, voiceRequestId, voiceChunkIndex, voiceChunkTotal, voicePiece =
+            path:match('^/physical/voice/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if voiceChunkToken then
+            local s = sessionForToken(voiceChunkToken)
+            if not s or not s.voiceJoined then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+            local idx, total = tonumber(voiceChunkIndex), tonumber(voiceChunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #voicePiece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+            local key = 'voice:' .. voiceChunkToken .. ':' .. voiceRequestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = voicePiece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local voiceSendToken, voiceSendRequest, voicePeer =
+            path:match('^/physical/voice/send/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if voiceSendToken then
+            local s = sessionForToken(voiceSendToken)
+            if not s or not s.voiceJoined or not s.voiceCallId or not s.voiceId then
+                sendJson(res, 403, { error = 'voice-session' })
+                return
+            end
+
+            local key = 'voice:' .. voiceSendToken .. ':' .. voiceSendRequest
+            local set = chunks[key]
+            if not set then sendJson(res, 400, { error = 'missing-chunks' }); return end
+            local parts = {}
+            for i = 1, set.total do
+                if not set.parts[i] then sendJson(res, 400, { error = 'missing-chunk' }); return end
+                parts[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local decoded = b64urlDecode(table.concat(parts))
+            local ok, payload = pcall(json.decode, decoded)
+            if not ok or type(payload) ~= 'table' then
+                sendJson(res, 400, { error = 'signal' })
+                return
+            end
+
+            local peerToken = voiceById[voicePeer]
+            local peerSession = peerToken and sessionForToken(peerToken, false) or nil
+            if not peerSession or not peerSession.voiceJoined
+                or tostring(peerSession.voiceCallId or '') ~= tostring(s.voiceCallId) then
+                sendJson(res, 404, { error = 'peer' })
+                return
+            end
+
+            voicePush(peerToken, { type = 'signal', peer = s.voiceId, data = payload })
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local uiToken = path:match('^/physical/ui/([%w_-]+)/*$')
+        if uiToken then
+            local s = sessionForToken(uiToken)
+            if not s then
+                sendHtml(res, '<h1>Session ended</h1><p class="bad">Run <b>/physicalpair</b> again.</p>', 403)
+                return
+            end
+
+            local index = LoadResourceFile(RES, 'html/index.html')
+            if not index then
+                sendHtml(res, '<h1>Missing UI</h1><p class="bad">html/index.html could not be read.</p>', 500)
+                return
+            end
+
+            local root = ('/%s/physical'):format(RES)
+            local base = ('/%s/physical/files/%s/html/'):format(RES, uiToken)
+            local injectHead = ('<base href="%s"><meta name="referrer" content="no-referrer">'):format(base)
+            index = index:gsub('<head>', '<head>' .. injectHead, 1)
+
+            local boot = ([[<script>
+window.__VPHONE_PHYSICAL__={token:"%s",base:"%s",resource:"%s"};
+</script><script src="physical.js"></script>
+<script src="reaperlink-voice.js"></script>
+<script src="sdk.js"></script>]]):format(uiToken, root, RES)
+
+            index = index:gsub('<script src="sdk%.js"></script>', boot, 1)
+            send(res, 200, 'text/html; charset=utf-8', index)
+            return
+        end
+
+        local staticToken, staticPath = path:match('^/physical/files/([%w_-]+)/(.+)$')
+        if staticToken and staticPath then
+            local s = sessionForToken(staticToken)
+            if not s then
+                send(res, 403, 'text/plain; charset=utf-8', 'Session ended')
+                return
+            end
+            staticPath = safeStaticPath(staticPath)
+            if not staticPath then
+                send(res, 400, 'text/plain; charset=utf-8', 'Bad path')
+                return
+            end
+            local data = LoadResourceFile(RES, staticPath)
+            if data == nil then
+                send(res, 404, 'text/plain; charset=utf-8', 'Not found')
+                return
+            end
+            send(res, 200, mimeFor(staticPath), data, {
+                ['Cache-Control'] = 'private, max-age=300',
+            })
+            return
+        end
+
+        local chunkToken, requestId, chunkIndex, chunkTotal, piece =
+            path:match('^/physical/chunk/([%w_-]+)/([%w_-]+)/(%d+)/(%d+)/([%w_-]+)$')
+        if chunkToken then
+            local s = sessionForToken(chunkToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+
+            local idx, total = tonumber(chunkIndex), tonumber(chunkTotal)
+            if not idx or not total or idx < 1 or total < 1 or idx > total
+                or total > MAX_CHUNKS or #piece > MAX_CHUNK_CHARS then
+                sendJson(res, 400, { error = 'chunk' })
+                return
+            end
+
+            local key = chunkToken .. ':' .. requestId
+            local set = chunks[key]
+            if not set or set.total ~= total then
+                set = { total = total, parts = {}, expires = GetGameTimer() + CHUNK_TTL_MS }
+                chunks[key] = set
+            end
+            set.parts[idx] = piece
+            set.expires = GetGameTimer() + CHUNK_TTL_MS
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local apiToken, requestId, callbackB64 =
+            path:match('^/physical/api/([%w_-]+)/([%w_-]+)/([%w_-]+)$')
+        if apiToken then
+            local s = sessionForToken(apiToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            if not allowRequest(apiToken) then
+                sendJson(res, 429, { error = 'rate' })
+                return
+            end
+            if pending[requestId] then
+                sendJson(res, 409, { error = 'duplicate' })
+                return
+            end
+
+            local key = apiToken .. ':' .. requestId
+            local set = chunks[key]
+            if not set then
+                sendJson(res, 400, { error = 'missing-body' })
+                return
+            end
+
+            local pieces = {}
+            for i = 1, set.total do
+                if not set.parts[i] then
+                    sendJson(res, 400, { error = 'missing-chunk', chunk = i })
+                    return
+                end
+                pieces[i] = set.parts[i]
+            end
+            chunks[key] = nil
+
+            local body = b64urlDecode(table.concat(pieces))
+            local callbackName = b64urlDecode(callbackB64)
+            if callbackName == '' or #callbackName > 96 then
+                sendJson(res, 400, { error = 'callback' })
+                return
+            end
+
+            local ok, data = pcall(json.decode, body ~= '' and body or '{}')
+            if not ok or type(data) ~= 'table' then data = {} end
+
+            pending[requestId] = {
+                source = s.source,
+                token = apiToken,
+                response = res,
+            }
+            TriggerClientEvent('v-phone:physical:invoke', s.source, requestId, callbackName, data)
+
+            SetTimeout(REQUEST_TTL_MS, function()
+                local waiting = pending[requestId]
+                if not waiting then return end
+                pending[requestId] = nil
+                sendJson(waiting.response, 504, { error = 'timeout', callback = callbackName })
+            end)
+            return
+        end
+
+        local eventToken, after = path:match('^/physical/events/([%w_-]+)/(%d+)$')
+        if eventToken then
+            local s = sessionForToken(eventToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            local last = tonumber(after) or 0
+            local out = {}
+            for _, entry in ipairs(s.events) do
+                if entry.seq > last then
+                    out[#out + 1] = entry
+                    if #out >= 64 then break end
+                end
+            end
+            sendJson(res, 200, {
+                ok = true,
+                seq = s.seq,
+                events = out,
+                player = GetPlayerName(s.source) or 'player',
+            })
+            return
+        end
+
+        local openToken = path:match('^/physical/open/([%w_-]+)$')
+        if openToken then
+            local s = sessionForToken(openToken)
+            if not s then
+                sendJson(res, 403, { error = 'session' })
+                return
+            end
+            TriggerClientEvent('v-phone:physical:open', s.source)
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        local disconnectToken = path:match('^/physical/disconnect/([%w_-]+)$')
+        if disconnectToken then
+            local s = sessionForToken(disconnectToken, false)
+            if s then endSession(disconnectToken, true) end
+            sendJson(res, 200, { ok = true })
+            return
+        end
+
+        send(res, 404, 'text/plain; charset=utf-8', 'Not found')
+    end)
+
+    print(('[v-phone] physical full bridge ready at /%s/physical'):format(RES))
+else
+    -- ══════════════════════════════════════════════════════════════
+    -- Physical phone bridge - client
+    -- ══════════════════════════════════════════════════════════════
+
+    -- This shared script loads BEFORE bridge/client/safety.lua. Capturing RegisterNUICallback
+    -- here means the later safety wrapper still does its normal exception/always-answer work,
+    -- while every final wrapped callback is also available to the paired physical browser.
+    local nativeRegisterNUICallback = RegisterNUICallback
+    local physicalCallbacks = {}
+    local physicalActive = false
+
+    function RegisterNUICallback(name, handler)
+        physicalCallbacks[tostring(name)] = handler
+        return nativeRegisterNUICallback(name, handler)
+    end
+
+    function PhysicalBridgeActive()
+        return physicalActive
+    end
+
+    function PhysicalInvokeNuiCallback(name, data, reply)
+        local handler = physicalCallbacks[tostring(name or '')]
+        if type(handler) ~= 'function' then
+            reply({ error = 'no-callback', callback = tostring(name or '') })
+            return
+        end
+
+        local answered = false
+        local function answer(result)
+            if answered then return end
+            answered = true
+            reply(result == nil and {} or result)
+        end
+
+        local ok, err = pcall(handler, type(data) == 'table' and data or {}, answer)
+        if not ok then
+            print(('[v-phone] physical callback %s raised: %s'):format(tostring(name), tostring(err)))
+            answer({ error = 'x' })
+        end
+    end
+
+    -- Mirror the same messages the stock client sends to CEF. When no real handset is paired,
+    -- the wrapper is one native call and a boolean check.
+    local nativeSendNUIMessage = SendNUIMessage
+    function SendNUIMessage(message)
+        local result = nativeSendNUIMessage(message)
+        if physicalActive and type(message) == 'table' then
+            TriggerServerEvent('v-phone:physical:nuiMessage', message)
+        end
+        return result
+    end
+
+    RegisterCommand('physicalpair', function()
+        TriggerServerEvent('v-phone:physical:pairRequest')
+    end, false)
+
+    RegisterNetEvent('v-phone:physical:pairCode', function(code, seconds, pairUrl, configured)
+        local msg = ('ReaperLink pairing code: %s (valid for %s seconds)'):format(
+            tostring(code), tostring(seconds or 600))
+        if type(pairUrl) == 'string' and pairUrl ~= '' then
+            msg = msg .. (' | %s'):format(pairUrl)
+        end
+        print(('[ReaperLink] %s'):format(msg))
+
+        if GetResourceState('chat') == 'started' then
+            TriggerEvent('chat:addMessage', {
+                color = { 200, 205, 212 },
+                multiline = true,
+                args = { 'ReaperLink', msg }
+            })
+        end
+
+        CreateThread(function()
+            ExecuteCommand('phone open')
+            Wait(180)
+            nativeSendNUIMessage({
+                action = 'reaperlink:pairing',
+                code = tostring(code),
+                seconds = tonumber(seconds) or 600,
+                url = type(pairUrl) == 'string' and pairUrl or '',
+                configured = configured == true,
+            })
+        end)
+    end)
+
+    RegisterNetEvent('v-phone:physical:session', function(active)
+        physicalActive = active == true
+        if not physicalActive then return end
+
+        -- Re-open once after pairing so the new browser receives a complete action=open payload
+        -- even when the in-game handset was already open before the session existed.
+        CreateThread(function()
+            ExecuteCommand('phone close')
+            Wait(150)
+            ExecuteCommand('phone open')
+        end)
+    end)
+
+    RegisterNetEvent('v-phone:physical:open', function()
+        ExecuteCommand('phone open')
+    end)
+
+    RegisterNetEvent('v-phone:physical:invoke', function(requestId, callbackName, data)
+        -- The server only emits this event for a validated live physical session. Do not gate
+        -- it on the local mirror flag: the first browser callback can arrive in the same few
+        -- milliseconds as the session-on event, and event ordering across the HTTP/client paths
+        -- should not turn the phone's boot request into a false "session" error.
+        if type(PhysicalInvokeNuiCallback) ~= 'function' then
+            TriggerServerEvent('v-phone:physical:nuiReply', requestId, { error = 'bridge' })
+            return
+        end
+
+        PhysicalInvokeNuiCallback(callbackName, data, function(result)
+            TriggerServerEvent('v-phone:physical:nuiReply', requestId, result)
+        end)
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- Original SDK example - still off by default
+-- ══════════════════════════════════════════════════════════════
+if not (Config and Config.SdkExample) then return end
+
+PhoneApp {
+    id       = 'example',
+    label    = 'Example',
+    icon     = 'note',
+    category = 'utilities',
+    desc     = 'The worked example: a folder dropped into apps/ and nothing else.',
+    developer = 'iFruit SDK',
+    version  = '2.0.0',
+    accent   = '#0A84FF',
+    permissions = { 'storage', 'contacts', 'photos', 'location', 'notifications' },
+    features = { 'Persistent data', 'Native pickers', 'Quick actions', 'Live lifecycle' },
+    keywords = { 'example', 'sdk', 'developer' },
+    optional = true,
+}
+, '')
+        local turnUser = tostring(GetConvar('reaperlink_voice_turn_user', '') or '')
+        local turnPass = tostring(GetConvar('reaperlink_voice_turn_pass', '') or '')
+        return {
+            stun = stun,
+            turn = {
+                url = turnUrl,
+                username = turnUser,
+                credential = turnPass,
+            },
+        }
     end
 
     local function newPairCode()
