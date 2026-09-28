@@ -62,9 +62,10 @@ switch ($Task) {
     Has "server/main.lua" "function ReaperLinkCallBridgeState(src)"
     Has "apps/example/app.lua" "browser may only join the active call mirrored"
     $bridge = Get-Content -LiteralPath (Join-Path $root "apps/example/app.lua") -Raw
-    if (($bridge.Split("SetHttpHandler(function(req, res)").Count - 1) -eq 1) {
+    $handlerCount = ([regex]::Matches($bridge, [regex]::Escape("SetHttpHandler(function(req, res)"))).Count
+    if ($handlerCount -eq 1) {
       Pass "one physical HTTP handler"
-    } else { Fail "duplicate physical HTTP handler detected" }
+    } else { Fail "duplicate physical HTTP handler detected ($handlerCount)" }
     $lines = (Get-Content -LiteralPath (Join-Path $root "apps/example/app.lua")).Count
     if ($lines -lt 1400) { Pass "physical bridge file size sane ($lines lines)" }
     else { Fail "physical bridge file unexpectedly large ($lines lines)" }
@@ -102,6 +103,9 @@ switch ($Task) {
     Has "apps/example/app.lua" "selfPhysical"
     Has "client/main.lua" "ReaperLinkMixedVoiceActive"
     Has "client/main.lua" "function ReaperLinkCallIsActive(id)"
+    Has "apps/example/app.lua" "function ReaperLinkVoiceRefreshCall(callId)"
+    Has "apps/example/app.lua" "function ReaperLinkVoiceEndCall(callId)"
+    Has "apps/example/app.lua" "VOICE_STALE_MS"
   }
   "https-gate" {
     Has "html/reaperlink-voice.js" "window.isSecureContext"
