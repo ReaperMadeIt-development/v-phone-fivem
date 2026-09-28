@@ -255,11 +255,18 @@ function Install-ReaperLink {
     Progress 15
 
     $existing = Find-VPhone $resources
+    $savedConfig = ''
     if ($existing) {
         $destination = $existing
         $backup = Join-Path ([System.IO.Directory]::GetParent($existing).FullName) ('v-phone_REAPERLINK_BACKUP_' + $stamp)
         Log ('Backing up existing v-phone -> ' + $backup)
         Copy-Item -LiteralPath $existing -Destination $backup -Recurse -Force
+        $oldConfig = Join-Path $existing 'config.lua'
+        if (Test-Path -LiteralPath $oldConfig) {
+            $savedConfig = Join-Path $work 'existing-config.lua'
+            Copy-Item -LiteralPath $oldConfig -Destination $savedConfig -Force
+            Log 'Preserved the existing v-phone config.lua.'
+        }
         [System.IO.Directory]::Delete($existing,$true)
     } else {
         $phoneGroup = Join-Path $resources '[phone]'
@@ -271,6 +278,10 @@ function Install-ReaperLink {
     Progress 30
 
     Copy-ReaperLinkResource -Destination $destination -WorkDir $work
+    if ($savedConfig -and (Test-Path -LiteralPath $savedConfig)) {
+        Copy-Item -LiteralPath $savedConfig -Destination (Join-Path $destination 'config.lua') -Force
+        Log 'Restored the server owner''s existing config.lua into ReaperLink.'
+    }
     foreach ($required in @('fxmanifest.lua','apps\example\app.lua','html\physical.js','html\reaperlink-voice.js','html\reaperlink-voice-game.js')) {
         if (-not (Test-Path -LiteralPath (Join-Path $destination $required))) { throw ('Installed resource is missing ' + $required) }
     }
