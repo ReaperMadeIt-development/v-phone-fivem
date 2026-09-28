@@ -1,0 +1,57 @@
+name: ReaperLink Voice Squad
+
+on:
+  push:
+    branches:
+      - reaperlink-voice-dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  squad:
+    name: ${{ matrix.slot }} - ${{ matrix.task }}
+    runs-on: [self-hosted, org-shared]
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        include:
+          - slot: Terminator
+            task: call-map
+          - slot: Predator
+            task: browser-audio
+          - slot: Johnny-5
+            task: microphone
+          - slot: Rambo
+            task: webrtc
+          - slot: Snake-Eyes
+            task: signaling
+          - slot: Dave
+            task: fivem-voice
+          - slot: Jeff
+            task: mixed-user
+          - slot: Steve
+            task: mobile
+          - slot: Mike
+            task: security
+          - slot: Gary
+            task: packaging
+
+    steps:
+      - name: Checkout ReaperLink Voice
+        uses: actions/checkout@v4
+
+      - name: Run squad task
+        shell: powershell
+        run: |
+          .\.github\scripts\reaperlink-voice-squad.ps1 -Task "${{ matrix.task }}" -Slot "${{ matrix.slot }}"
+
+      - name: Upload squad report
+        uses: actions/upload-artifact@v4
+        with:
+          name: reaperlink-voice-${{ matrix.task }}-${{ runner.name }}
+          path: .squad-reports\${{ matrix.task }}.txt
+          if-no-files-found: error
