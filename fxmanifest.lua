@@ -255,6 +255,7 @@ files {
     -- ReaperLink pairing QR is generated locally; no third-party QR service.
     'html/qrcode.js',
     'html/reaper-mark.svg',
+    'html/reaperlink-voice.js',
     'html/app.js',
     -- The app SDK. Served to any resource that ships a phone app, which is why it
     -- is a file rather than a copied snippet.
