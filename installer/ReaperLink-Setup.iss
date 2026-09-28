@@ -32,7 +32,6 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 SetupLogging=yes
 ShowLanguageDialog=no
-SetupIconFile=
 VersionInfoVersion=0.1.0.0
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription=ReaperLink Voice FiveM Tester Installer
