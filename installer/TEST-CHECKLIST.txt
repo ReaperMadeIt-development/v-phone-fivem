@@ -1,0 +1,35 @@
+REAPERLINK VOICE TEST CHECKLIST
+===============================
+
+[ ] Server boots with v-phone and existing resources.
+[ ] /physicalpair creates a QR.
+[ ] Physical phone pairs over HTTPS.
+[ ] Home screen/apps/control actions still work.
+[ ] /reaperlinkvoicetest requests mic permission.
+[ ] Solo recording plays back.
+[ ] Default output route checked (receiver/earpiece when browser/OS permits).
+[ ] Speaker button checked.
+[ ] Physical phone -> physical phone call.
+[ ] Physical phone -> normal FiveM headset call.
+[ ] Normal FiveM headset -> physical phone audio.
+[ ] Mute works from physical handset.
+[ ] Answer works from physical handset.
+[ ] Hangup works from physical handset.
+[ ] Closing/suspending phone browser cleans up stale voice endpoint.
+[ ] Denying physical mic does not leave half-open voice state.
+[ ] Denying FiveM NUI mic falls back to normal FiveM headset audio.
+[ ] Second call works after the first ends.
+[ ] Normal FiveM -> FiveM calls still work through existing voice resource.
+[ ] Re-pair works after v-phone/server restart.
+[ ] Rollback script restores previous v-phone + server.cfg.
+
+Please record:
+- phone make/model
+- mobile OS version
+- browser/version
+- FiveM artifact version
+- framework
+- voice resource
+- same Wi-Fi vs cross-network
+- whether STUN/TURN was configured
+- exact error/status text if a test fails
