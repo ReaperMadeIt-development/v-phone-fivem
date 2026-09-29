@@ -140,7 +140,9 @@ begin
     'FiveM Server',
     'Choose the FiveM server-data folder',
     'Select the folder containing both server.cfg and the resources folder.' + #13#10 +
-    'Example: E:\testserver\file'
+    'Example: E:\testserver\file',
+    False,
+    ''
   );
   ServerPage.Add('');
   if IsValidServerData('E:\testserver\file') then
