@@ -111,7 +111,7 @@ begin
   if (VoicePage.Values[0] <> '') or (VoicePage.Values[1] <> '') then
     VoiceText := 'Custom STUN/TURN settings';
 
-  ReviewPage.Msg :=
+  ReviewPage.MsgLabel.Caption :=
     'Server data folder:' + #13#10 +
     '  ' + ServerPage.Values[0] + #13#10#13#10 +
     'HTTPS mode:' + #13#10 +
