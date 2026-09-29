@@ -12,52 +12,51 @@ function Test-ServerRoot {
            (Test-Path -LiteralPath (Join-Path $Path 'resources') -PathType Container)
 }
 
+$candidates = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
 function Add-Candidate {
-    param([System.Collections.Generic.List[string]]$List,[string]$Path)
+    param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     try { $full = [System.IO.Path]::GetFullPath($Path) } catch { return }
-    if ((Test-ServerRoot $full) -and -not $List.Contains($full)) {
-        $List.Add($full)
+    if (Test-ServerRoot $full) {
+        [void]$candidates.Add($full.TrimEnd('\'))
     }
 }
 
-$candidates = [System.Collections.Generic.List[string]]::new()
+# Scan local fixed and removable filesystem drives in drive-letter order.
+$drives = @(Get-CimInstance Win32_LogicalDisk |
+    Where-Object { $_.DriveType -in @(2,3) -and $_.DeviceID } |
+    Sort-Object DeviceID |
+    ForEach-Object { $_.DeviceID + '\' })
 
-# Fast checks for common FiveM / txAdmin layouts.
-$common = @(
-    'C:\\txData', 'C:\\FXServer', 'C:\\FiveM', 'C:\\fivem', 'C:\\servers', 'C:\\server',
-    'D:\\txData', 'D:\\FXServer', 'D:\\FiveM', 'D:\\fivem', 'D:\\servers', 'D:\\server',
-    'E:\\txData', 'E:\\FXServer', 'E:\\FiveM', 'E:\\fivem', 'E:\\servers', 'E:\\server', 'E:\\testserver', 'E:\\testserver\\file'
+$skipNames = @(
+    'Windows','Program Files','Program Files (x86)','$Recycle.Bin',
+    'System Volume Information','node_modules','.git'
 )
-foreach ($path in $common) { Add-Candidate $candidates $path }
-
-foreach ($base in @($env:USERPROFILE, $env:LOCALAPPDATA, $env:APPDATA)) {
-    if (-not $base) { continue }
-    foreach ($name in @('txData','FXServer','FiveM','fivem','servers','server','testserver')) {
-        Add-Candidate $candidates (Join-Path $base $name)
-    }
-}
-
-# Breadth-first scan of fixed drives, deliberately depth-limited to stay fast.
-$skipNames = @('Windows','Program Files','Program Files (x86)','$Recycle.Bin','System Volume Information','node_modules','.git')
 $maxDepth = 5
-$maxDirectories = 7000
-$visited = 0
+$maxDirectoriesPerDrive = 7000
 
-$drives = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object { $_.DeviceID + '\\' }
 foreach ($drive in $drives) {
-    if ($candidates.Count -gt 0) { break }
+    # Quick checks first for common FiveM / txAdmin layouts on this exact drive.
+    foreach ($relative in @(
+        '', 'txData', 'FXServer', 'FiveM', 'fivem', 'servers', 'server',
+        'testserver', 'testserver\file', 'server-data', 'serverdata'
+    )) {
+        if ($relative) { Add-Candidate (Join-Path $drive $relative) }
+        else { Add-Candidate $drive }
+    }
 
+    # Then breadth-first scan this drive with its own independent budget.
+    $visited = 0
     $queue = [System.Collections.Generic.Queue[object]]::new()
     $queue.Enqueue([PSCustomObject]@{ Path = $drive; Depth = 0 })
 
-    while ($queue.Count -gt 0 -and $visited -lt $maxDirectories -and $candidates.Count -eq 0) {
+    while ($queue.Count -gt 0 -and $visited -lt $maxDirectoriesPerDrive) {
         $node = $queue.Dequeue()
         $visited++
 
         if (Test-ServerRoot $node.Path) {
-            Add-Candidate $candidates $node.Path
-            break
+            Add-Candidate $node.Path
         }
 
         if ($node.Depth -ge $maxDepth) { continue }
@@ -70,16 +69,24 @@ foreach ($drive in $drives) {
     }
 }
 
-# Prefer a server already containing v-phone, then txData-style paths, then the shortest valid path.
-$best = $candidates |
+# Also check common user-profile locations in case a server is stored there.
+foreach ($base in @($env:USERPROFILE, $env:LOCALAPPDATA, $env:APPDATA)) {
+    if (-not $base) { continue }
+    foreach ($name in @('txData','FXServer','FiveM','fivem','servers','server','testserver','server-data','serverdata')) {
+        Add-Candidate (Join-Path $base $name)
+    }
+}
+
+# Prefer an existing v-phone install, then a txAdmin/server-style path, then the shortest valid path.
+$best = @($candidates) |
     Sort-Object -Property @(
-        @{ Expression = { if (Test-Path -LiteralPath (Join-Path $_ 'resources') -PathType Container) {
+        @{ Expression = {
                 $vp = Get-ChildItem -LiteralPath (Join-Path $_ 'resources') -Directory -Recurse -ErrorAction SilentlyContinue |
                     Where-Object { $_.Name -eq 'v-phone' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'fxmanifest.lua')) } |
                     Select-Object -First 1
                 if ($vp) { 0 } else { 1 }
-            } else { 1 } }; Ascending = $true },
-        @{ Expression = { if ($_ -match '(?i)txData|server-data|testserver') { 0 } else { 1 } }; Ascending = $true },
+            }; Ascending = $true },
+        @{ Expression = { if ($_ -match '(?i)txData|server-data|serverdata|testserver|FXServer') { 0 } else { 1 } }; Ascending = $true },
         @{ Expression = { $_.Length }; Ascending = $true }
     ) |
     Select-Object -First 1
