@@ -3,7 +3,7 @@
 
 #define MyAppName "ReaperLink Voice Tester"
 #define MyAppVersion "0.1.0-preview"
-#define MyAppPublisher "ReaperMadeIt"
+#define MyAppPublisher "ReaperMadeIt-Devlopment"
 #define MyAppURL "https://github.com/ReaperMadeIt-development/v-phone-fivem"
 
 [Setup]
