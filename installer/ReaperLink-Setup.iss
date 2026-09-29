@@ -40,6 +40,7 @@ VersionInfoProductVersion=0.1.0.0
 
 [Files]
 Source: "ReaperLink-InstallCore.ps1"; DestDir: "{tmp}\ReaperLinkSetup"; Flags: ignoreversion deleteafterinstall
+Source: "ReaperLink-DetectServer.ps1"; Flags: dontcopy
 Source: "README-TESTERS.txt"; DestDir: "{tmp}\ReaperLinkSetup"; Flags: ignoreversion deleteafterinstall
 Source: "TEST-CHECKLIST.txt"; DestDir: "{tmp}\ReaperLinkSetup"; Flags: ignoreversion deleteafterinstall
 
@@ -90,6 +91,42 @@ begin
     DirExists(AddBackslash(Path) + 'resources');
 end;
 
+function DetectServerData(): string;
+var
+  PowerShellPath: string;
+  DetectorPath: string;
+  OutputPath: string;
+  Params: string;
+  Candidate: string;
+  ResultCode: Integer;
+  OutputText: AnsiString;
+begin
+  Result := '';
+  try
+    ExtractTemporaryFile('ReaperLink-DetectServer.ps1');
+    PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+    DetectorPath := ExpandConstant('{tmp}\ReaperLink-DetectServer.ps1');
+    OutputPath := ExpandConstant('{tmp}\reaperlink-detected-server.txt');
+    DeleteFile(OutputPath);
+
+    Params :=
+      '-NoProfile -ExecutionPolicy Bypass -File "' + DetectorPath + '"' +
+      ' -OutputPath "' + OutputPath + '"';
+
+    if Exec(PowerShellPath, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      if FileExists(OutputPath) and LoadStringFromFile(OutputPath, OutputText) then
+      begin
+        Candidate := Trim(String(OutputText));
+        if IsValidServerData(Candidate) then
+          Result := Candidate;
+      end;
+    end;
+  except
+    Result := '';
+  end;
+end;
+
 procedure UpdateReview;
 var
   ModeText: string;
@@ -132,21 +169,24 @@ begin
 end;
 
 procedure InitializeWizard;
+var
+  DetectedServer: string;
 begin
   WizardForm.Caption := 'ReaperLink Voice Tester Setup';
 
   ServerPage := CreateInputDirPage(
     wpSelectDir,
     'FiveM Server',
-    'Choose the FiveM server-data folder',
-    'Select the folder containing both server.cfg and the resources folder.' + #13#10 +
-    'Example: E:\testserver\file',
+    'Confirm the FiveM server-data folder',
+    'ReaperLink scans local drives automatically for a folder containing both server.cfg and resources. If nothing is detected, select the folder manually.',
     False,
     ''
   );
   ServerPage.Add('');
-  if IsValidServerData('E:\testserver\file') then
-    ServerPage.Values[0] := 'E:\testserver\file';
+
+  DetectedServer := DetectServerData();
+  if DetectedServer <> '' then
+    ServerPage.Values[0] := DetectedServer;
 
   HttpsPage := CreateInputOptionPage(
     ServerPage.ID,
