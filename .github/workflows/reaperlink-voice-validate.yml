@@ -68,7 +68,7 @@ jobs:
 
   qa:
     name: ${{ matrix.persona }} - ${{ matrix.task }}
-    runs-on: [self-hosted, Windows, X64, testing, qa]
+    runs-on: [self-hosted, Windows, X64, org-shared]
     timeout-minutes: 25
     strategy:
       fail-fast: false
