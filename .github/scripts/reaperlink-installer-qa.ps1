@@ -83,7 +83,7 @@ switch ($Task) {
   'safety-gate' {
     $core = ReadText 'installer\ReaperLink-InstallCore.ps1'
     foreach ($needle in @(
-      'server.cfg.reaperlink-backup_',
+      "$cfg + '.reaperlink-backup_'",
       'v-phone_REAPERLINK_BACKUP_',
       'Preserved existing config.lua',
       'Restored server owner config.lua into ReaperLink',
@@ -116,10 +116,10 @@ switch ($Task) {
     Pass 'Required ReaperLink payload files exist.'
 
     $manifest = ReadText 'fxmanifest.lua'
-    foreach ($needle in @('reaperlink-voice.js','reaperlink-voice-game.js','physical.js')) {
+    foreach ($needle in @('reaperlink-voice.js','reaperlink-voice-game.js')) {
       if (-not $manifest.Contains($needle)) { Fail ("fxmanifest missing: " + $needle) }
     }
-    Pass 'fxmanifest ships the ReaperLink physical and voice browser assets.'
+    Pass 'fxmanifest ships the ReaperLink voice browser assets; physical.js is served by the authenticated physical HTTP bridge.'
   }
 
   'compile-gate' {
